@@ -59,6 +59,24 @@ final class KernelBlendTests: XCTestCase {
         XCTAssertFalse(out.polygons.isEmpty)
     }
 
+    func testTwoDistancesChamferRemovesAsymmetricPrism() {
+        let mesh = cube(side: 2)
+        let render = EuclidBridge.renderMesh(from: mesh)
+        let edge = EdgeTopology.selectableEdges(from: render).first { $0.isConvex }!
+
+        let d1 = 0.4
+        let d2 = 0.6
+        let out = KernelOps.chamferEdge(
+            mesh: mesh, p0: d3(edge.start), p1: d3(edge.end),
+            normalA: d3(edge.normalA), normalB: d3(edge.normalB),
+            setback: d1, setbackB: d2)
+
+        // Removed ≈ ½·d1·d2·edgeLen = ½·0.4·0.6·2 = 0.24.
+        XCTAssertEqual(volume(out), 8 - (d1 * d2), accuracy: 5e-3,
+                       "asymmetric chamfer removes a (d1·d2/2)·edgeLen triangular prism")
+        XCTAssertFalse(out.polygons.isEmpty)
+    }
+
     func testChamferDegenerateSetbackIsNoOp() {
         let mesh = cube(side: 2)
         let edge = EdgeTopology.selectableEdges(

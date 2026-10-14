@@ -165,6 +165,33 @@ struct ExtrudeGizmoOverlay: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("ExtrudeArrowValue")
+
+                if let context = viewModel.toolContext, case .extrude = context.kind {
+                    Menu {
+                        Button("0° (None)") { viewModel.setExtrudeDraftAngle(0) }
+                        Button("2°") { viewModel.setExtrudeDraftAngle(2) }
+                        Button("5°") { viewModel.setExtrudeDraftAngle(5) }
+                        Button("10°") { viewModel.setExtrudeDraftAngle(10) }
+                        Button("15°") { viewModel.setExtrudeDraftAngle(15) }
+                        Divider()
+                        Button("-5° (Outward)") { viewModel.setExtrudeDraftAngle(-5) }
+                        Button("-10° (Outward)") { viewModel.setExtrudeDraftAngle(-10) }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "triangle.righthalf.filled")
+                                .font(.system(size: 9))
+                            Text(String(format: "Draft: %.1f°", context.draftAngle))
+                                .font(.caption2.weight(.medium))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 7))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.regularMaterial, in: Capsule())
+                        .overlay(Capsule().stroke(abs(context.draftAngle) > 1e-4 ? Color.orange : Color.clear, lineWidth: 1))
+                    }
+                    .accessibilityIdentifier("ExtrudeDraftAngleMenu")
+                }
             }
         }
     }

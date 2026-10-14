@@ -185,3 +185,46 @@ final class BodyTextureCache {
 
     var entryCount: Int { cache.count }
 }
+
+/// Triple-buffered pool for ephemeral line segments and triangles (sketches and fills),
+/// completely eliminating per-frame MTLBuffer allocations and GPU driver hitches.
+final class TransientMetalBufferPool {
+    private static let ringSize = 3
+    private var ringIndex = 0
+    private var pools: [[MTLBuffer]] = Array(repeating: [], count: ringSize)
+    private var currentIndex = 0
+
+    /// Advance to the next frame slot in the triple-buffer ring.
+    func beginFrame() {
+        ringIndex = (ringIndex + 1) % Self.ringSize
+        currentIndex = 0
+    }
+
+    /// Obtain an MTLBuffer with `bytes` copied in. Reuses existing buffers when possible.
+    func buffer(bytes: UnsafeRawPointer, length: Int, device: MTLDevice) -> MTLBuffer? {
+        guard length > 0 else { return nil }
+        var currentSlotPool = pools[ringIndex]
+        if currentIndex < currentSlotPool.count {
+            let existing = currentSlotPool[currentIndex]
+            if existing.length >= length {
+                existing.contents().copyMemory(from: bytes, byteCount: length)
+                currentIndex += 1
+                return existing
+            }
+        }
+        // Allocate with 50% headroom or at least 4KB to amortize expansions
+        let capacity = max(length, max(4096, (length * 3) / 2))
+        guard let newBuffer = device.makeBuffer(length: capacity, options: .storageModeShared) else {
+            return nil
+        }
+        newBuffer.contents().copyMemory(from: bytes, byteCount: length)
+        if currentIndex < currentSlotPool.count {
+            currentSlotPool[currentIndex] = newBuffer
+        } else {
+            currentSlotPool.append(newBuffer)
+        }
+        pools[ringIndex] = currentSlotPool
+        currentIndex += 1
+        return newBuffer
+    }
+}

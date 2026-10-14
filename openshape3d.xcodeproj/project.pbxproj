@@ -40,6 +40,7 @@
 		7F7046013010F00000347100 /* Exceptions for "openshape3dTests" folder in "openshape3dTests" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				"Fixtures/bugreport-a6fea315-fillet.os3d",
 				"Fixtures/Captures/boss-bore-face-merge/a.brep",
 				"Fixtures/Captures/boss-bore-face-merge/b.brep",
 				"Fixtures/Captures/boss-bore-face-merge/manifest.json",
@@ -59,7 +60,6 @@
 				"Fixtures/Captures/pipe-junction-over-s-step-shell/shape.brep",
 				"Fixtures/Captures/port-junction-fillet-chain-credit/manifest.json",
 				"Fixtures/Captures/port-junction-fillet-chain-credit/shape.brep",
-				"Fixtures/bugreport-a6fea315-fillet.os3d",
 			);
 			target = 7F704321300C0ED7003471DC /* openshape3dTests */;
 		};
@@ -474,7 +474,7 @@
 				CLANG_WARN_DOCUMENTATION_COMMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 4;
-				DEVELOPMENT_TEAM = 34FWY7G2HB;
+				DEVELOPMENT_TEAM = JLAUKZQ7XR;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -531,7 +531,7 @@
 				CLANG_WARN_DOCUMENTATION_COMMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 4;
-				DEVELOPMENT_TEAM = 34FWY7G2HB;
+				DEVELOPMENT_TEAM = JLAUKZQ7XR;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER = readwrite;
 				ENABLE_HARDENED_RUNTIME = YES;

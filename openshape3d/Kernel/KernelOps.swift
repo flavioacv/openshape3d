@@ -462,12 +462,13 @@ nonisolated extension KernelOps {
         p1: SIMD3<Double>,
         normalA: SIMD3<Double>,
         normalB: SIMD3<Double>,
-        setback: Double
+        setback: Double,
+        setbackB: Double? = nil
     ) -> Euclid.Mesh {
         blendEdges(
             mesh: mesh,
             edges: [BlendEdgeSpec(p0: p0, p1: p1, normalA: normalA, normalB: normalB)],
-            amount: setback, isFillet: false)
+            amount: setback, amountB: setbackB, isFillet: false)
     }
 
     /// Fillet (round) a single convex straight edge to `radius`. Subtracts the
@@ -502,6 +503,7 @@ nonisolated extension KernelOps {
         mesh: Euclid.Mesh,
         edges: [BlendEdgeSpec],
         amount: Double,
+        amountB: Double? = nil,
         isFillet: Bool
     ) -> Euclid.Mesh {
         guard amount > 1e-6 else { return mesh }
@@ -520,7 +522,7 @@ nonisolated extension KernelOps {
                     let s = chain.segments[0]
                     tool = cornerWedge(
                         p0: s.p0, p1: s.p1, normalA: s.normalA, normalB: s.normalB,
-                        setback: amount, round: isFillet ? amount : nil,
+                        setback: amount, setbackB: amountB, round: isFillet ? amount : nil,
                         isConvex: convex)
                 } else {
                     // A blend bigger than the curve it sits on cannot be built,
@@ -537,7 +539,7 @@ nonisolated extension KernelOps {
                         // would let the user commit a blend that did nothing.
                         return Euclid.Mesh([])
                     }
-                    tool = sweptBlendTool(chain: chain, amount: amount, isFillet: isFillet)
+                    tool = sweptBlendTool(chain: chain, amount: amount, amountB: amountB, isFillet: isFillet)
                 }
                 guard let tool, !tool.polygons.isEmpty else { continue }
                 // The whole point of the convex/concave split: a convex blend
@@ -733,6 +735,7 @@ nonisolated extension KernelOps {
     private static func sweptBlendTool(
         chain: BlendChain,
         amount: Double,
+        amountB: Double? = nil,
         isFillet: Bool
     ) -> Euclid.Mesh? {
         let segs = chain.segments
@@ -764,9 +767,10 @@ nonisolated extension KernelOps {
         // run apex → faceA setback → (arc samples) → faceB setback; every
         // section must emit the SAME count for the loft.
         let arcSteps = 8
+        let effB = amountB ?? amount
         func section(at apex: SIMD3<Double>, frame: Frame) -> [SIMD3<Double>]? {
             let sa = apex + frame.tA * amount
-            let sb = apex + frame.tB * amount
+            let sb = apex + frame.tB * effB
             var bis = frame.tA + frame.tB
             let bl = simd_length(bis)
             guard bl > 1e-6 else { return nil }
@@ -899,6 +903,7 @@ nonisolated extension KernelOps {
         normalA: SIMD3<Double>,
         normalB: SIMD3<Double>,
         setback: Double,
+        setbackB: Double? = nil,
         round: Double?,
         isConvex: Bool = true
     ) -> Euclid.Mesh? {
@@ -935,8 +940,10 @@ nonisolated extension KernelOps {
         if simd_dot(tB, nA) * want < 0 { tB = -tB }
 
         let apex = (p0 + p1) / 2
-        let sa = apex + tA * setback
-        let sb = apex + tB * setback
+        let sA = setback
+        let sB = setbackB ?? setback
+        let sa = apex + tA * sA
+        let sb = apex + tB * sB
         // A subtracted tool overshoots both ends so the cut runs clean past the
         // edge. A UNIONED one must not: the overshoot would be material added
         // beyond where the edge stops, left standing proud of the end faces as

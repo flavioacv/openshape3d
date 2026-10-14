@@ -145,6 +145,7 @@ struct ToolPaletteView: View {
             modifyItem("Sweep", "scribble.variable", .sweep, "SweepButton"),
             modifyItem("Loft", "square.stack.3d.up", .loft, "LoftButton"),
             modifyItem("Helix", "tornado", .helix, "HelixButton"),
+            modifyItem("Wrap", "skew", .wrap, "WrapButton"),
             toggleItem("Chamfer", "square.on.circle", "ChamferButton",
                        active: isMode { if case .pickingBlendEdges(.chamfer) = $0 { return true }; return false },
                        enabled: !viewModel.session.document.bodies.isEmpty, tint: .blue,
@@ -172,6 +173,11 @@ struct ToolPaletteView: View {
                        enabled: !viewModel.session.document.bodies.isEmpty, tint: .blue,
                        begin: { viewModel.beginDeleteFace() },
                        cancel: { viewModel.cancelDeleteFace() }),
+            toggleItem("Patch", "bandage", "PatchButton",
+                       active: isMode { if case .pickingPatchEdges = $0 { return true }; return false },
+                       enabled: !viewModel.session.document.bodies.isEmpty, tint: .blue,
+                       begin: { viewModel.beginPatch() },
+                       cancel: { viewModel.cancelPatch() }),
         ])
     }
 
@@ -249,6 +255,7 @@ struct ToolPaletteView: View {
          sketchTool("Arc", "point.topleft.down.to.point.bottomright.curvepath", .arc),
          sketchTool("Ellipse", "oval", .ellipse),
          sketchTool("Polygon", "hexagon", .polygon),
+         sketchTool("Slot", "capsule", .slot),
          sketchTool("Text", "textformat", .text)]
     }
 
@@ -501,6 +508,10 @@ struct ToolPaletteView: View {
 
     private var mirrorMenu: some View {
         Menu {
+            Toggle(isOn: $viewModel.mirrorKeepOriginal) {
+                Label("Keep Original", systemImage: viewModel.mirrorKeepOriginal ? "checkmark" : "")
+            }
+            Divider()
             ForEach(Array(viewModel.mirrorPlaneOptions.enumerated()), id: \.offset) { _, option in
                 Button(option.label) {
                     viewModel.mirrorSelection(across: option.plane)

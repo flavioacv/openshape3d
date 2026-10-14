@@ -13,6 +13,7 @@ enum SketchTool: String, CaseIterable {
     case arc
     case ellipse
     case polygon
+    case slot
     /// Tap-to-trim: no drawing; taps delete the entity span under them.
     case trim
     /// Text (plan §B7, spec §1.12): taps place the text dialog's glyph
@@ -33,7 +34,7 @@ enum SketchTool: String, CaseIterable {
 /// it doesn't ripple through every mode switch). Extrude is the default a plain
 /// region tap already gives; the others route into their existing pick flows.
 enum CreateTool: String, CaseIterable {
-    case extrude, revolve, sweep, loft, helix
+    case extrude, revolve, sweep, loft, helix, wrap
 }
 
 /// An edge blend (Phase E, spec §4.3): chamfer flattens the corner, fillet
@@ -137,6 +138,10 @@ enum EditorMode: Equatable {
     /// `PlaneConstruction` needs — points, faces, edges or a curve. See
     /// `EditorViewModel.planePicks`.
     case pickingPlaneReferences
+    /// Wrap & Emboss (spec §4.15): waiting for a tap on a cylindrical face to wrap the profile onto.
+    case pickingWrapTarget
+    /// Solid Patch (spec §4.18 / Shapr3D Tools.SolidPatch): waiting for boundary loop edges / body selection to seal watertight.
+    case pickingPatchEdges
 
     var isSketching: Bool {
         if case .sketching = self { return true }

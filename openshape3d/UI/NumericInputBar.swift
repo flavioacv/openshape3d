@@ -110,9 +110,15 @@ struct NumericInputBar: View {
                 sweepBar(context)
             case .loft:
                 loftBar(context)
+            case .wrap(let target, let depth):
+                wrapBar(context, target: target, depth: depth)
             }
+        } else if viewModel.mode == .pickingWrapTarget {
+            pickingWrapTargetBar
         } else if case .sketching(_, .some(.polygon)) = viewModel.mode {
             polygonBar
+        } else if case .sketching(_, .some(.slot)) = viewModel.mode {
+            slotBar
         } else if let body = viewModel.editingPrimitiveBody, let spec = body.primitive {
             AdaptiveBar {
                 Text(spec.displayName)
@@ -561,6 +567,40 @@ struct NumericInputBar: View {
         }
     }
 
+    private var slotBar: some View {
+        AdaptiveBar {
+            Text("Slot")
+                .font(.headline)
+                .fixedSize()
+            BarHint("Drag from center to center")
+
+            HStack(spacing: 6) {
+                Text("Radius")
+                    .font(.caption)
+                    .foregroundStyle(.barLabel)
+                    .fixedSize()
+                ExpressionValueField(
+                    placeholder: "Radius",
+                    value: Binding(
+                        get: { viewModel.slotRadius },
+                        set: { viewModel.slotRadius = max(0.1, $0) }
+                    ),
+                    kind: .length,
+                    clamp: nil,
+                    width: 80,
+                    identifier: "SlotRadiusField"
+                )
+            }
+            Spacer()
+        } actions: {
+            Button("Done") {
+                viewModel.deselectSketchTool()
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("SlotDone")
+        }
+    }
+
     /// Radial push/pull on a cylinder edits the diameter (Shapr3D Offset Face).
     private func diameterBar(_ context: EditorViewModel.ToolContext, radius: Double) -> some View {
         AdaptiveBar {
@@ -735,6 +775,9 @@ struct NumericInputBar: View {
                 Button("Helix") {
                     viewModel.showHelixOptions = true
                 }
+                Button("Wrap") {
+                    viewModel.beginWrapTargetPick()
+                }
             }
             // Face pulls can become an offset construction plane instead.
             if context.sourceBody != nil {
@@ -839,6 +882,68 @@ struct NumericInputBar: View {
             .buttonStyle(.borderedProminent)
             .disabled(count < 2)
             .accessibilityIdentifier("LoftCommit")
+        }
+    }
+
+    private func wrapBar(_ context: EditorViewModel.ToolContext, target: WrapKit.Target, depth: Double) -> some View {
+        AdaptiveBar {
+            Text(depth >= 0 ? "Wrap Emboss" : "Wrap Engrave")
+                .font(.headline)
+                .fixedSize()
+
+            HStack(spacing: 6) {
+                Text("Depth")
+                    .font(.caption)
+                    .foregroundStyle(.barLabel)
+                    .fixedSize()
+                ExpressionValueField(
+                    placeholder: "Depth",
+                    value: Binding(
+                        get: { abs(depth) },
+                        set: { viewModel.setWrapDepth(depth >= 0 ? max(0.01, $0) : -max(0.01, $0)) }
+                    ),
+                    kind: .length,
+                    clamp: nil,
+                    width: 90,
+                    identifier: "WrapDepthField",
+                    onSubmit: { viewModel.commitTool() }
+                )
+            }
+
+            Button(depth >= 0 ? "Emboss (Raised)" : "Engrave (Cut)") {
+                viewModel.setWrapDepth(-depth)
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.accentColor)
+
+            Spacer()
+        } actions: {
+            Button("Cancel") {
+                viewModel.cancelTool()
+            }
+            Button("Apply") {
+                viewModel.commitTool()
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("WrapCommit")
+        }
+    }
+
+    private var pickingWrapTargetBar: some View {
+        AdaptiveBar {
+            Text("Wrap & Emboss")
+                .font(.headline)
+                .fixedSize()
+            Text("Tap a cylinder or cylindrical face to wrap the profile onto")
+                .font(.caption)
+                .foregroundStyle(.barLabel)
+                .fixedSize()
+            Spacer()
+        } actions: {
+            Button("Cancel") {
+                viewModel.cancelWrapTargetPick()
+            }
+            .buttonStyle(.bordered)
         }
     }
 

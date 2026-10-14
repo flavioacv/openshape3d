@@ -757,7 +757,7 @@ final class EditorViewModel {
                     origin: SIMD3(Float(tip.x), Float(tip.y), Float(tip.z)),
                     direction: SIMD3(Float(n.x), Float(n.y), Float(n.z))
                 )
-            case .sweep, .loft:
+            case .sweep, .loft, .wrap:
                 break // no drag-editable parameter → no arrow
             }
         }
@@ -1228,7 +1228,7 @@ final class EditorViewModel {
         if case .sketching(let activeID, _) = mode,
            let sketch = session.document.sketches.first(where: { $0.id == activeID }) {
             let pendings = [pendingEntity, pendingArcEntity].compactMap { $0 } + rectanglePreview
-                + splinePolygonPreview
+                + splinePolygonPreview + pendingSlotPreview
             if !pendings.isEmpty {
                 // A released three-point baseline is the active construction
                 // edge (native orange), not a new blue stroke or committed edge.
@@ -1532,6 +1532,7 @@ final class EditorViewModel {
             case .measuring: return measurePoints
             case .translating, .aligning: return transformPickPoints
             case .pickingPlaneReferences: return planePickMarkers
+            case .pickingPatchEdges: return patchLoopPoints
             case .pickingAxisReferences:
                 return axisPicks.compactMap { if case let .point(p) = $0 { return p }; return nil }
             default: return []
@@ -3548,7 +3549,7 @@ final class EditorViewModel {
     /// Body that moves in an Align (owner of the first tapped snap point).
     private var alignSourceBody: BodyID?
     /// Source geometry reference picked for Align (cylinder axis, plane, or point).
-    private var alignSourceReference: AlignReference?
+    private(set) var alignSourceReference: AlignReference?
 
     func beginTranslatePick() {
         guard !selection.isEmpty else { return }
@@ -3720,6 +3721,7 @@ final class EditorViewModel {
         resetBlendState()
         resetShellState()
         resetDeleteFaceState()
+        resetPatchState()
         resetReplaceFaceState()
         resetSketchOffsetState()
         resetAxisState()
@@ -3929,16 +3931,23 @@ final class EditorViewModel {
         return best.map { ($0.point, $0.bodyID) }
     }
 
-    // MARK: - Mirror (spec §5.6, Keep Original always on for v1)
+    // MARK: - Mirror (spec §5.6)
+
+    /// Toggle whether the original body is preserved when mirroring (Shapr3D parity).
+    var mirrorKeepOriginal = true
 
     /// Mirror planes offered by the palette: world planes plus any
-    /// construction planes in the document.
+    /// construction planes in the document, plus any currently selected planar face.
     var mirrorPlaneOptions: [(label: String, plane: SketchPlane)] {
-        var options: [(label: String, plane: SketchPlane)] = [
+        var options: [(label: String, plane: SketchPlane)] = []
+        if let facePlane = toolContext?.plane {
+            options.append(("Selected Face", facePlane))
+        }
+        options.append(contentsOf: [
             ("XY Plane", .worldXY),
             ("YZ Plane", .worldYZ),
             ("Ground (ZX)", .ground),
-        ]
+        ])
         for (index, plane) in session.document.planes.enumerated() {
             options.append(("Plane \(index + 1)", plane.plane))
         }
@@ -3966,7 +3975,7 @@ final class EditorViewModel {
             transform.translation = pivot
             let localMesh = mirrored.translated(by: Vector(-pivot.x, -pivot.y, -pivot.z))
             var copy = Body(
-                name: document.uniqueBodyName(base: body.name),
+                name: document.uniqueBodyName(base: "\(body.name) (Mirror)"),
                 transform: transform,
                 primitive: nil,
                 euclidMesh: localMesh,
@@ -3984,7 +3993,11 @@ final class EditorViewModel {
                 copy.brep = OCCTKernel.transformed(reflected, by: toLocal)
             }
             document.bodies.append(copy) // keeps the next name unique
-            commands.append(AddBodyCommand(body: copy, title: "Mirror"))
+            if mirrorKeepOriginal {
+                commands.append(AddBodyCommand(body: copy, title: "Mirror"))
+            } else {
+                commands.append(ReplaceBodyCommand(title: "Mirror", before: body, after: copy))
+            }
             // Phase D: record a `.mirror` history node for a feature-owned source
             // so the reflected copy rebuilds associatively. Bundled into the same
             // command list (one CompositeCommand) so a single undo drops the copy
@@ -3996,7 +4009,7 @@ final class EditorViewModel {
                     kind: .mirror(
                         body: BodyRef(producer: owner.id, bodyID: id),
                         plane: PlaneRef(source: .explicit(plane)),
-                        keepOriginal: true
+                        keepOriginal: mirrorKeepOriginal
                     ),
                     outputBodyIDs: [copy.id]
                 )
@@ -4042,9 +4055,45 @@ final class EditorViewModel {
     var blendBodyID: BodyID?
     /// Convex edges (body-LOCAL space) the user has toggled for the blend.
     var blendSelectedEdges: [SelectableEdge] = []
+    enum ChamferMode: String, CaseIterable {
+        case equalDistance = "Equal Distance"
+        case twoDistances = "Two Distances"
+        case distanceAndAngle = "Distance & Angle"
+    }
+    var chamferMode: ChamferMode = .equalDistance {
+        didSet { updateChamferValues() }
+    }
+    var chamferAngle: Double = 45.0 {
+        didSet { if chamferMode == .distanceAndAngle { updateChamferValues() } }
+    }
+
+    private func updateChamferValues() {
+        switch chamferMode {
+        case .equalDistance:
+            blendValue2 = nil
+        case .twoDistances:
+            if blendValue2 == nil { blendValue2 = blendValue }
+        case .distanceAndAngle:
+            let rad = max(5.0, min(85.0, chamferAngle)) * .pi / 180.0
+            blendValue2 = max(0.01, blendValue * tan(rad))
+        }
+    }
+
     /// The blend size (setback for chamfer, radius for fillet), in mm.
     var blendValue: Double = 1 {
-        didSet { if blendValue != oldValue { updateBlendPreview() } }
+        didSet {
+            if blendValue != oldValue {
+                if chamferMode == .distanceAndAngle {
+                    let rad = max(5.0, min(85.0, chamferAngle)) * .pi / 180.0
+                    blendValue2 = max(0.01, blendValue * tan(rad))
+                }
+                updateBlendPreview()
+            }
+        }
+    }
+    /// Second setback distance for two-distances chamfer (Shapr3D Tools.Chamfer.TwoDistances)
+    var blendValue2: Double? = nil {
+        didSet { if blendValue2 != oldValue { updateBlendPreview() } }
     }
     /// Live result preview: the source body with the pending blend applied,
     /// rendered IN PLACE of the source while the pick is armed (same swap the
@@ -4067,6 +4116,7 @@ final class EditorViewModel {
         // tool gets an unobstructed picking surface.
         selection.removeAll()
         blendValue = 1
+        blendValue2 = nil
         blendPreview = nil
         mode = .pickingBlendEdges(kind)
     }
@@ -4208,6 +4258,7 @@ final class EditorViewModel {
         blendSelectedEdges = []
         blendBodyID = nil
         blendPreview = nil
+        blendValue2 = nil
         // Clearing the EDIT state here is what stops a cancelled edit leaking
         // into the next blend: `commitBlend` branches on `blendEditingFeature`,
         // so a stale one would make a fresh pick silently overwrite the edges
@@ -4230,7 +4281,8 @@ final class EditorViewModel {
         }
         return KernelOps.blendEdges(
             mesh: source.euclidMesh(), edges: specs,
-            amount: blendValue, isFillet: kind == .fillet)
+            amount: blendValue, amountB: kind == .chamfer ? blendValue2 : nil,
+            isFillet: kind == .fillet)
     }
 
     /// The blend result for the current pick, branching on the source's
@@ -5183,6 +5235,102 @@ final class EditorViewModel {
         mode = .selected(source.id)
         selection = [source.id]
         session.save()
+    }
+
+    // MARK: - Solid Patch (spec §4.18 / Shapr3D Tools.SolidPatch)
+
+    /// The body being patched (if attached to an existing body).
+    var patchBodyID: BodyID?
+    /// Ordered points forming the boundary loop to patch.
+    var patchLoopPoints: [SIMD3<Double>] = []
+
+    /// Arm Patch from the Modify palette.
+    func beginPatch() {
+        cancelTransientPicks()
+        cancelTool()
+        patchLoopPoints = []
+        patchBodyID = selection.count == 1 ? selection.first : nil
+        mode = .pickingPatchEdges
+    }
+
+    /// Cancel Patch and restore previous selection.
+    func cancelPatch() {
+        guard case .pickingPatchEdges = mode else { return }
+        let body = patchBodyID
+        resetPatchState()
+        if let body, session.document.body(with: body) != nil {
+            mode = .selected(body)
+            selection = [body]
+        } else {
+            mode = .idle
+        }
+    }
+
+    func resetPatchState() {
+        patchLoopPoints = []
+        patchBodyID = nil
+        if case .pickingPatchEdges = mode { mode = .idle }
+    }
+
+    /// Tap while Patch is armed: pick points or vertices to form boundary loop.
+    func handlePatchTap(ray: Ray) {
+        if let point = nearestNotablePoint(to: ray) {
+            if let index = patchLoopPoints.firstIndex(where: { simd_length($0 - point) < 1e-4 }) {
+                patchLoopPoints.remove(at: index)
+            } else {
+                patchLoopPoints.append(point)
+            }
+            return
+        }
+        if let hit = HitTester.pickBody(ray: ray, in: scene) {
+            patchBodyID = hit.bodyID
+        }
+    }
+
+    /// Can commit when at least 3 points form a closed loop.
+    var canCommitPatch: Bool {
+        guard case .pickingPatchEdges = mode else { return false }
+        return patchLoopPoints.count >= 3
+    }
+
+    /// Apply: generate patch surface and seal onto body if selected, or add as new surface body.
+    func commitPatch() {
+        guard canCommitPatch else { return }
+        guard let patchMesh = PatchKit.patch(loop: patchLoopPoints) else {
+            reportFailure("Couldn't compute patch face for this boundary loop.")
+            return
+        }
+
+        if let bodyID = patchBodyID, let body = session.document.body(with: bodyID) {
+            let existingMesh = EuclidBridge.euclidMesh(from: body.render)
+            let sealed = PatchKit.seal(mesh: existingMesh, loop: patchLoopPoints)
+            let after = Body(
+                id: body.id,
+                name: body.name,
+                transform: body.transform,
+                primitive: nil,
+                euclidMesh: sealed,
+                revision: 0
+            )
+            session.perform(ReplaceBodyCommand(title: "Patch", before: body, after: after))
+            session.save()
+            showNotice("Boundary patched and sealed watertight.")
+        } else {
+            var doc = session.document
+            let nextRev = doc.nextRevision()
+            let newBody = Body(
+                id: BodyID(),
+                name: "Patch",
+                transform: .identity,
+                primitive: nil,
+                euclidMesh: patchMesh,
+                revision: nextRev
+            )
+            session.perform(AddBodyCommand(body: newBody, title: "Patch"))
+            session.save()
+            showNotice("Patch surface created.")
+        }
+        cancelPatch()
     }
 
     // MARK: - Replace Face (direct modeling, spec §4.12)
@@ -6899,6 +7047,8 @@ final class EditorViewModel {
             pickSweepPathEntity(ray: ray)
         case .pickingLoftProfiles:
             pickLoftProfile(ray: ray)
+        case .pickingWrapTarget:
+            pickWrapTarget(ray: ray)
         case .pickingBooleanTool(let kind, let targetID):
             handleBooleanToolTap(kind: kind, targetID: targetID, ray: ray)
         case .pickingFeatureBody(let featureID):
@@ -6941,6 +7091,8 @@ final class EditorViewModel {
             handleAxisReferenceTap(ray: ray)
         case .pickingPlaneReferences:
             handlePlaneReferenceTap(ray: ray)
+        case .pickingPatchEdges:
+            handlePatchTap(ray: ray)
         }
     }
 
@@ -8004,6 +8156,8 @@ final class EditorViewModel {
             case sweep(spine: [SIMD3<Double>])
             /// Loft through `loftProfiles` in selection order (plan §B2).
             case loft
+            /// Wrap & Emboss (spec §4.15): map profile onto a cylindrical face and emboss by depth.
+            case wrap(target: WrapKit.Target, depth: Double)
         }
 
         var profile: Profile
@@ -8055,6 +8209,8 @@ final class EditorViewModel {
             switch kind {
             case .extrude(let distance), .offsetPlane(let distance):
                 return distance
+            case .wrap(_, let depth):
+                return depth
             case .revolve, .sweep, .loft:
                 return nil
             }
@@ -8164,6 +8320,7 @@ final class EditorViewModel {
         case .sweep:   beginSweepPathPick()
         case .loft:    beginLoftProfilePick()
         case .helix:   showHelixOptions = true
+        case .wrap:    beginWrapTargetPick()
         }
     }
 
@@ -8229,12 +8386,29 @@ final class EditorViewModel {
         return beginToolDrag(ray: ray)
     }
 
+    private var isDraggingTool = false
+    private var lastToolRebuildFinished: TimeInterval = 0
+    private var lastToolRebuildDuration: TimeInterval = 0
+
+    /// Self-tuning gate: skip intermediate CSG rebuilds during drag if the previous
+    /// rebuild took longer than ~35ms, allowing the finger tracking to remain fluid at 60-120fps.
+    private var shouldSkipToolPreviewDuringDrag: Bool {
+        guard isDraggingTool, lastToolRebuildDuration > 0.035 else { return false }
+        return ProcessInfo.processInfo.systemUptime - lastToolRebuildFinished < lastToolRebuildDuration
+    }
+
     private func rebuildToolPreview(_ context: inout ToolContext) {
         if case .offsetPlane = context.kind {
             // The pending plane renders as a quad, not a preview body.
             context.preview = nil
             context.isPendingValid = true
             return
+        }
+        guard !shouldSkipToolPreviewDuringDrag else { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            lastToolRebuildFinished = ProcessInfo.processInfo.systemUptime
+            lastToolRebuildDuration = lastToolRebuildFinished - started
         }
         let mesh: Euclid.Mesh
         switch context.kind {
@@ -8330,6 +8504,9 @@ final class EditorViewModel {
             mesh = KernelOps.loft(
                 profiles: context.loftProfiles.map { ($0.profile, $0.holes, $0.plane) }
             )
+        case .wrap(let target, let depth):
+            let loop = context.profile.loop
+            mesh = WrapKit.embossSolid(loop: loop, onto: target, settings: WrapKit.Settings(depth: depth)) ?? Euclid.Mesh([])
         }
         updatePendingValidity(&context, toolMesh: mesh)
         guard !mesh.polygons.isEmpty else {
@@ -8452,7 +8629,7 @@ final class EditorViewModel {
         // sub-pixel jitter make many consecutive events resolve to the SAME
         // distance. Skip the (expensive) CSG rebuild when nothing moved so the
         // drag stays responsive instead of backing up behind redundant rebuilds.
-        guard abs(distance - current) > 1e-6 else { return }
+        guard abs(distance - current) > 1e-4 else { return }
         context.kind = .extrude(distance: distance)
         rebuildToolPreview(&context)
         toolContext = context
@@ -8604,6 +8781,8 @@ final class EditorViewModel {
             commitSweep(context, spine: spine)
         case .loft:
             commitLoft(context)
+        case .wrap(let target, let depth):
+            commitWrap(context, target: target, depth: depth)
         }
     }
 
@@ -9536,6 +9715,69 @@ final class EditorViewModel {
         )
     }
 
+    // MARK: - Wrap & Emboss (spec §4.15)
+
+    func beginWrapTargetPick() {
+        guard case .extruding = mode, let context = toolContext,
+              context.sketchID != nil
+        else { return }
+        mode = .pickingWrapTarget
+    }
+
+    func cancelWrapTargetPick() {
+        if case .pickingWrapTarget = mode {
+            mode = .extruding
+        }
+    }
+
+    func setWrapDepth(_ depth: Double) {
+        guard var context = toolContext, case .wrap(let target, _) = context.kind else { return }
+        context.kind = .wrap(target: target, depth: depth)
+        rebuildToolPreview(&context)
+        toolContext = context
+    }
+
+    func pickWrapTarget(ray: Ray) {
+        guard var context = toolContext, let hit = HitTester.pickBody(ray: ray, in: scene),
+              let body = session.document.body(with: hit.bodyID)
+        else {
+            showNotice("Tap a cylinder or cylindrical face to wrap onto")
+            return
+        }
+        let cylFace = FaceTopology.cylindricalFace(in: body.render, seedTriangle: hit.triangleIndex)
+            ?? FaceTopology.enumerateFaces(in: body.render).cylindrical.first
+        guard let cyl = cylFace else {
+            showNotice("This body has no cylindrical face to wrap onto.")
+            return
+        }
+        let worldPoint = body.transform.rotation.act(cyl.axisPoint * body.transform.scale) + body.transform.translation
+        let worldDir = simd_normalize(body.transform.rotation.act(cyl.axisDir))
+        let target = WrapKit.Target(
+            axisPoint: worldPoint,
+            axisDir: worldDir,
+            reference: WrapKit.Target.anyPerpendicular(to: worldDir),
+            radius: cyl.radius
+        )
+        context.kind = .wrap(target: target, depth: 2.0)
+        rebuildToolPreview(&context)
+        toolContext = context
+        mode = .extruding
+    }
+
+    private func commitWrap(_ context: ToolContext, target: WrapKit.Target, depth: Double) {
+        guard abs(depth) > 1e-4, let preview = context.preview else {
+            cancelTool()
+            return
+        }
+        commitToolResult(
+            preview: preview,
+            mergeTool: preview.euclidMesh(),
+            sample: nil,
+            title: depth >= 0 ? "Wrap Emboss" : "Wrap Engrave",
+            context: context
+        )
+    }
+
     // MARK: - Helix (plan §B16, spec §1.17 minimal: a helix drives a sweep)
 
     /// "Helix" in the extrude bar: sweep the armed profile along a generated
@@ -9576,6 +9818,7 @@ final class EditorViewModel {
 
     func beginToolDrag(ray: Ray) -> Bool {
         guard let context = toolContext else { return false }
+        isDraggingTool = true
         // Start each drag with a clean cache so the first preview frame rebuilds
         // from the current source (not a body memoised during a prior commit).
         cachedPullWorldBody = nil
@@ -9597,7 +9840,8 @@ final class EditorViewModel {
         case .revolve(_, let angle):
             extrudeDragAnchor = nil // angle drags are always screen-space
             toolDragStartValue = angle
-        case .sweep, .loft:
+        case .sweep, .loft, .wrap:
+            isDraggingTool = false
             return false // no drag-editable parameter
         }
         return true
@@ -9624,9 +9868,10 @@ final class EditorViewModel {
             } else {
                 raw = toolDragStartValue + screenDeltaWorld
             }
-            // Snap to 0.5 steps, like the sketch grid.
+            // Snap to 0.5 steps, like the sketch grid; clamp sub-pixel noise to 0.05 mm
             let snapped = (raw / 0.5).rounded() * 0.5
-            let value = abs(raw - snapped) < 0.15 ? snapped : raw
+            let freeGranularity = (raw * 20).rounded() / 20
+            let value = abs(raw - snapped) < 0.15 ? snapped : freeGranularity
             if case .offsetPlane = context.kind {
                 setOffsetPlaneDistance(value)
             } else {
@@ -9636,8 +9881,9 @@ final class EditorViewModel {
             let raw = toolDragStartValue + screenDeltaWorld * Self.revolveDegreesPerWorldUnit
             // Snap to 15° stops (90, 180, …) with a small capture window.
             let snapped = (raw / 15).rounded() * 15
-            setRevolveAngle(abs(raw - snapped) < 4 ? snapped : raw)
-        case .sweep, .loft:
+            let freeAngle = (raw * 2).rounded() / 2 // 0.5 degree steps
+            setRevolveAngle(abs(raw - snapped) < 4 ? snapped : freeAngle)
+        case .sweep, .loft, .wrap:
             break // no drag-editable parameter
         }
     }
@@ -9646,8 +9892,14 @@ final class EditorViewModel {
         // Shapr3D: releasing the drag keeps the dynamic preview so you can
         // refine the value; commit by tapping empty space or the tool button
         // ("select an empty area of the grid to complete the tool").
+        isDraggingTool = false
         extrudeDragAnchor = nil
         cachedPullWorldBody = nil
+        // Settle the preview with the final distance if an intermediate frame was throttled
+        if var context = toolContext {
+            rebuildToolPreview(&context)
+            toolContext = context
+        }
     }
 
     // MARK: - Sketch mode
@@ -9766,6 +10018,8 @@ final class EditorViewModel {
     private var rectangleIDs = (0..<4).map { _ in UUID() }
     private var rectanglePreview: [SketchEntity] = []
     private var rectangleBaselineDimension: SketchDimension?
+    var slotRadius: Double = 5.0
+    var pendingSlotPreview: [SketchEntity] = []
     var hasPendingRectangle: Bool { rectangleAnchor != nil || rectangleBaseline != nil }
     var rectangleInstruction: String {
         if rectangleType == .threePoint {
@@ -9864,6 +10118,17 @@ final class EditorViewModel {
             selectedSketchPoints.removeAll()
             rectangleAnchor = point
         }
+    }
+
+    func commitSlot(from a: SIMD2<Double>, to b: SIMD2<Double>, radius: Double) {
+        guard case .sketching(let sketchID, _) = mode, let sketch = activeSketch else { return }
+        let entities = SlotConstruction.makeCenterSlot(center1: a, center2: b, radius: radius)
+        guard !entities.isEmpty else { return }
+        var after = sketch
+        after.entities.append(contentsOf: entities)
+        session.perform(ReplaceSketchGeometryCommand(title: "Draw Slot", before: sketch, after: after))
+        selectedSketchEntityIDs = Set(entities.map(\.id))
+        session.save()
     }
 
     /// In-progress entity during a sketch drag (rubber band).
@@ -11601,6 +11866,16 @@ final class EditorViewModel {
     }
 
     private func handlePlaneReferenceTap(ray: Ray) {
+        // Smart inference (Shapr3D): tapping a second face while in Offset mode
+        // infers the user wants a Midplane between the two faces.
+        if planeConstruction == .offset && planePicks.count == 1,
+           let secondPick = constructionPick(.face, ray: ray) {
+            planeConstruction = .midplane
+            planePicks.append(secondPick)
+            recomputePlanePreview()
+            return
+        }
+
         // Every slot filled: a further tap starts a fresh set rather than
         // being ignored (the same rule as Add Axis).
         if planeNextSlot == nil { planePicks = [] }
@@ -12992,6 +13267,9 @@ final class EditorViewModel {
         if tool == .rect, rectangleType == .threePoint {
             updateRectanglePreview(from: start, to: current)
             pendingEntity = nil
+        } else if tool == .slot {
+            pendingSlotPreview = SlotConstruction.makeCenterSlot(center1: start, center2: current, radius: slotRadius)
+            pendingEntity = nil
         } else {
             pendingEntity = makeEntity(tool: tool, from: start, to: current)
         }
@@ -13000,6 +13278,7 @@ final class EditorViewModel {
     func endSketchStroke(ray: Ray) {
         defer {
             pendingEntity = nil
+            pendingSlotPreview = []
             sketchStrokeStart = nil
             sketchStrokeCurrent = nil
             activeSnap = nil
@@ -13055,6 +13334,10 @@ final class EditorViewModel {
         }
         if tool == .rect, rectangleType == .threePoint {
             placeThreePointRectangle(from: start, to: end, sketchID: sketchID)
+            return
+        }
+        if tool == .slot {
+            commitSlot(from: start, to: end, radius: slotRadius)
             return
         }
         guard let entity = makeEntity(tool: tool, from: start, to: end) else { return }
@@ -13358,7 +13641,7 @@ final class EditorViewModel {
                 id: UUID(), center: a, radius: radius,
                 sides: max(3, polygonSides), rotation: atan2(delta.y, delta.x)
             )
-        case .trim, .text, .project, .offset:
+        case .trim, .text, .project, .offset, .slot:
             return nil // These tools never rubber-band draw.
         }
     }
@@ -16241,8 +16524,47 @@ final class EditorViewModel {
         var id: String { label }
     }
 
+    private struct MeasurementsCacheKey: Equatable {
+        let changeCount: Int
+        let modeDescription: String
+        let selection: Set<BodyID>
+        let sketchEntities: Set<UUID>
+        let selectedPlane: Bool
+        let selectedImage: Bool
+        let unit: DisplayUnit
+        let measureResultDist: Double?
+        let blendEdgeCount: Int
+        let shellFaceCount: Int
+    }
+
+    private var cachedMeasurementsKey: MeasurementsCacheKey?
+    private var cachedMeasurementsValue: [MeasurementRow] = []
+
     /// Measurements for the current selection, shown in the bottom info strip.
+    /// Results are cached against document changes and selection state to eliminate UI stalls.
     var selectionMeasurements: [MeasurementRow] {
+        let key = MeasurementsCacheKey(
+            changeCount: session.changeCount,
+            modeDescription: String(describing: mode),
+            selection: selection,
+            sketchEntities: selectedSketchEntityIDs,
+            selectedPlane: selectedPlane != nil,
+            selectedImage: selectedImage != nil,
+            unit: AppSettings.shared.unit,
+            measureResultDist: measureResult?.distance,
+            blendEdgeCount: blendSelectedEdges.count,
+            shellFaceCount: shellSelectedFaces.count
+        )
+        if let cached = cachedMeasurementsKey, cached == key {
+            return cachedMeasurementsValue
+        }
+        let fresh = computeSelectionMeasurements()
+        cachedMeasurementsKey = key
+        cachedMeasurementsValue = fresh
+        return fresh
+    }
+
+    private func computeSelectionMeasurements() -> [MeasurementRow] {
         _ = session.changeCount
         // An Items-selected construction plane reads "1 plane" (Shapr3D).
         if selectedPlane != nil {
@@ -16287,7 +16609,7 @@ final class EditorViewModel {
                 let bodies = selection.compactMap { session.document.body(with: $0) }
                 guard let box = MeasureKit.boundingBox(bodies: bodies) else { return [] }
                 let size = box.max - box.min
-                return [
+                var rows = [
                     MeasurementRow(label: "Selected", value: "\(bodies.count) bodies"),
                     MeasurementRow(
                         label: "Bounds",
@@ -16301,6 +16623,16 @@ final class EditorViewModel {
                         }()
                     ),
                 ]
+                if bodies.count == 2 {
+                    if let boxA = MeasureKit.boundingBox(bodies: [bodies[0]]),
+                       let boxB = MeasureKit.boundingBox(bodies: [bodies[1]]) {
+                        let centerA = (boxA.min + boxA.max) * 0.5
+                        let centerB = (boxB.min + boxB.max) * 0.5
+                        let centerDist = simd_length(centerB - centerA)
+                        rows.append(MeasurementRow(label: "Center Dist", value: Self.formattedLength(centerDist)))
+                    }
+                }
+                return rows
             }
             guard let body = session.document.body(with: id),
                   let box = MeasureKit.boundingBox(bodies: [body])
@@ -16336,12 +16668,32 @@ final class EditorViewModel {
                     label: "Radius", value: Self.formattedLength(radius)
                 ))
             }
+            if entities.count == 2 {
+                if case let .circle(_, c1, _) = entities[0], case let .circle(_, c2, _) = entities[1] {
+                    let d = simd_length(c2 - c1)
+                    rows.append(MeasurementRow(label: "Center Dist", value: Self.formattedLength(d)))
+                }
+            }
             // Two parallel lines: Shapr3D adds the distance between them
             // (observed 2026-09-13: "2 edges  279,925.293 mm  22,558.0444 mm").
             if let distance = Self.parallelLineDistance(entities) {
                 rows.append(MeasurementRow(label: "Distance", value: Self.formattedLength(distance)))
             }
             return rows
+        case .measuring:
+            if let result = measureResult {
+                return [
+                    MeasurementRow(label: "Distance", value: Self.formattedLength(result.distance)),
+                    MeasurementRow(label: "ΔX", value: Self.formattedLength(abs(result.deltas.x))),
+                    MeasurementRow(label: "ΔY", value: Self.formattedLength(abs(result.deltas.y))),
+                    MeasurementRow(label: "ΔZ", value: Self.formattedLength(abs(result.deltas.z))),
+                ]
+            } else if let pt = measurePoints.first {
+                return [
+                    MeasurementRow(label: "Point 1", value: String(format: "(%.1f, %.1f, %.1f)", pt.x, pt.y, pt.z))
+                ]
+            }
+            return []
         case .pickingBlendEdges:
             // Chamfer/Fillet pick (Phase E): edge count + total world length.
             guard !blendSelectedEdges.isEmpty else { return [] }
@@ -16365,6 +16717,27 @@ final class EditorViewModel {
             guard !deleteFaceTargets.isEmpty else { return [] }
             return [
                 MeasurementRow(label: "Faces", value: "\(deleteFaceTargets.count)"),
+            ]
+        case .pickingPatchEdges:
+            guard !patchLoopPoints.isEmpty else { return [] }
+            return [
+                MeasurementRow(label: "Patch Vertices", value: "\(patchLoopPoints.count)"),
+            ]
+        case .aligning:
+            if let src = alignSourceReference {
+                let kind: String
+                switch src {
+                case .cylinder: kind = "Cylinder Axis"
+                case .plane: kind = "Planar Face"
+                case .point: kind = "Point"
+                }
+                return [
+                    MeasurementRow(label: "Source", value: kind),
+                    MeasurementRow(label: "Step", value: "Pick destination"),
+                ]
+            }
+            return [
+                MeasurementRow(label: "Align", value: "Pick source on body")
             ]
         case .pickingReplaceFace:
             guard let face = replaceSourceFace else { return [] }
@@ -17349,7 +17722,7 @@ final class EditorViewModel {
         case .loft:
             return loftFeatureNode(
                 context: context, boolean: boolean, outputBodyIDs: outputBodyIDs)
-        case .offsetPlane:
+        case .offsetPlane, .wrap:
             return nil
         }
     }

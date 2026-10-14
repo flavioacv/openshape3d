@@ -168,6 +168,7 @@ extension EditorViewModel {
         case "model.revolve":       return armCreateTool(.revolve)
         case "model.sweep":         return armCreateTool(.sweep)
         case "model.loft":          return armCreateTool(.loft)
+        case "model.wrap":          return armCreateTool(.wrap)
 
         // MARK: Blends and shell — need a body
         case "model.fillet":        return armBlend(.fillet)

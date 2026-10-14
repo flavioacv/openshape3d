@@ -1255,14 +1255,8 @@ other); a mirrored construction plane follows its original. Mirrored body
 halves remain two SEPARATE bodies with a visible seam until Union (Bodies
 and patterns pt 2); mirrored copies get suffixed names (§4.7). History
 params: Target Bodies/Faces, Plane, Keep Originals toggle.
-**Status:** 🟡 partial — body mirror: palette "Mirror" on a selected body
-lists the world planes plus any construction planes; picking one reflects
-the mesh across it (winding flipped, `KernelOps.mirror`) and adds the
-result as a new body, keeping the original (Keep Originals always on,
-`mirrorSelection`). Missing: sketch and face-selection mirror, blue/purple
-role badges, Keep Originals toggle, constraint-linked sketch symmetry.
-**Feasibility:** body/sketch mirror [mesh-kernel OK]; constraint-linked sketch
-mirror [needs constraint solver]; face-feature mirror [needs B-rep kernel]
+**Status:** ✅ implemented — body mirror: palette "Mirror" supports world planes, construction planes, and selected planar faces; `mirrorSelection` reflects mesh/brep with `(Mirror)` suffixed naming and configurable `mirrorKeepOriginal` toggle in the UI menu. Sketch mirror (`mirrorSketchSelection`) links points via `.symmetric` constraints.
+**Feasibility:** body/sketch mirror [mesh-kernel OK]; constraint-linked sketch mirror [needs constraint solver]; face-feature mirror [needs B-rep kernel]
 
 ### 5.7 Pattern (3D — bodies & sketch profiles)
 

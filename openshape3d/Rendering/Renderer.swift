@@ -31,6 +31,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var didMarkFirstDraw = false
     #endif
     private let orientationCubeRenderer = OrientationCubeRenderer()
+    private let transientBuffers = TransientMetalBufferPool()
     private var viewportSize = CGSize(width: 1, height: 1)
 
     /// Sketch stroke weight, in DRAWABLE PIXELS (`viewportSize` is the drawable,
@@ -69,6 +70,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         #if DEBUG
         if !didMarkFirstDraw { didMarkFirstDraw = true; OpenTiming.mark("first draw") }
         #endif
+        transientBuffers.beginFrame()
         guard
             let descriptor = view.currentRenderPassDescriptor,
             let commandBuffer = context.commandQueue.makeCommandBuffer()
@@ -259,8 +261,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                 body.baseColor = batch.color
                 let length = batch.triangles.count * MemoryLayout<SIMD3<Float>>.stride
                 guard let buffer = batch.triangles.withUnsafeBytes({ raw in
-                    context.device.makeBuffer(bytes: raw.baseAddress!, length: length,
-                                              options: .storageModeShared)
+                    transientBuffers.buffer(bytes: raw.baseAddress!, length: length,
+                                           device: context.device)
                 }) else { continue }
                 encoder.setVertexBuffer(buffer, offset: 0, index: Int(BufferIndexPositions.rawValue))
                 encoder.setVertexBytes(&body, length: MemoryLayout<BodyUniforms>.stride,
@@ -286,8 +288,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                 body.lineHalfWidthPx = Self.sketchStrokeWidthPixels / 2
                 let length = batch.segments.count * MemoryLayout<SIMD3<Float>>.stride
                 guard let buffer = batch.segments.withUnsafeBytes({ raw in
-                    context.device.makeBuffer(bytes: raw.baseAddress!, length: length,
-                                              options: .storageModeShared)
+                    transientBuffers.buffer(bytes: raw.baseAddress!, length: length,
+                                           device: context.device)
                 }) else { continue }
                 encoder.setVertexBuffer(buffer, offset: 0, index: Int(BufferIndexPositions.rawValue))
                 encoder.setVertexBytes(&body, length: MemoryLayout<BodyUniforms>.stride,

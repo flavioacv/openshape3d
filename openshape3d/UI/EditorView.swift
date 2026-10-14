@@ -481,10 +481,49 @@ struct EditorView: View {
                     .fixedSize()
             }
             Divider().frame(height: 20)
-            Text(kind.valueLabel).font(.caption).foregroundStyle(.barLabel).fixedSize()
-            // Text, applied live, arithmetic allowed — see ExpressionValueField.
-            ExpressionValueField(placeholder: settings.unit.symbol, value: value,
-                                 clamp: nil, identifier: "BlendValueField")
+            if kind == .chamfer {
+                Picker("Chamfer Mode", selection: Binding(
+                    get: { viewModel.chamferMode },
+                    set: { viewModel.chamferMode = $0 }
+                )) {
+                    ForEach(EditorViewModel.ChamferMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityIdentifier("ChamferModePicker")
+            }
+            if kind == .chamfer && viewModel.chamferMode == .twoDistances {
+                Text("D1").font(.caption).foregroundStyle(.barLabel).fixedSize()
+                ExpressionValueField(placeholder: settings.unit.symbol, value: value,
+                                     clamp: nil, identifier: "BlendValueField")
+                Text("D2").font(.caption).foregroundStyle(.barLabel).fixedSize()
+                ExpressionValueField(placeholder: settings.unit.symbol, value: Binding(
+                    get: { viewModel.blendValue2 ?? viewModel.blendValue },
+                    set: { viewModel.blendValue2 = max(0.01, $0) }
+                ), clamp: nil, identifier: "BlendValue2Field")
+            } else if kind == .chamfer && viewModel.chamferMode == .distanceAndAngle {
+                Text("Dist").font(.caption).foregroundStyle(.barLabel).fixedSize()
+                ExpressionValueField(placeholder: settings.unit.symbol, value: value,
+                                     clamp: nil, identifier: "BlendValueField")
+                Text("Angle").font(.caption).foregroundStyle(.barLabel).fixedSize()
+                ExpressionValueField(placeholder: "°", value: Binding(
+                    get: { viewModel.chamferAngle },
+                    set: { viewModel.chamferAngle = max(5.0, min(85.0, $0)) }
+                ), clamp: nil, identifier: "ChamferAngleField")
+                Text("°").font(.caption).foregroundStyle(.barLabel).fixedSize()
+                Button("30°") { viewModel.chamferAngle = 30.0 }
+                    .buttonStyle(.bordered).controlSize(.mini)
+                Button("45°") { viewModel.chamferAngle = 45.0 }
+                    .buttonStyle(.bordered).controlSize(.mini)
+                Button("60°") { viewModel.chamferAngle = 60.0 }
+                    .buttonStyle(.bordered).controlSize(.mini)
+            } else {
+                Text(kind.valueLabel).font(.caption).foregroundStyle(.barLabel).fixedSize()
+                ExpressionValueField(placeholder: settings.unit.symbol, value: value,
+                                     clamp: nil, identifier: "BlendValueField")
+            }
             Text(settings.unit.symbol).font(.caption).foregroundStyle(.barLabel).fixedSize()
             // While dragging, show the kernel-derived ceiling the drag is
             // clamped to, so the stop doesn't read as a stuck gesture.
@@ -587,6 +626,59 @@ struct EditorView: View {
             return "The surrounding faces can't heal that"
         }
         return "\(count) face\(count == 1 ? "" : "s") to delete"
+    }
+
+    private func patchBar(_ viewModel: EditorViewModel) -> some View {
+        AdaptiveBar(style: .capsule, spacing: 12) {
+            Image(systemName: "bandage")
+            Text(patchHint(viewModel))
+                .font(.subheadline)
+                .fixedSize()
+        } actions: {
+            Button("Cancel") { viewModel.cancelPatch() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("PatchCancel")
+            Button("Apply") { viewModel.commitPatch() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(!viewModel.canCommitPatch)
+                .accessibilityIdentifier("PatchApply")
+        }
+    }
+
+    private func patchHint(_ viewModel: EditorViewModel) -> String {
+        if viewModel.patchBodyID == nil && viewModel.patchLoopPoints.isEmpty {
+            return "Tap a body or boundary points to patch"
+        }
+        let count = viewModel.patchLoopPoints.count
+        if count == 0 { return "Tap boundary points to form a loop" }
+        if count < 3 { return "\(count) points picked — need at least 3 for a patch" }
+        return "\(count) points loop — ready to patch"
+    }
+
+    private func alignBar(_ viewModel: EditorViewModel) -> some View {
+        AdaptiveBar(style: .capsule, spacing: 12) {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+            Text(alignHint(viewModel))
+                .font(.subheadline)
+                .fixedSize()
+        } actions: {
+            Button("Cancel") { viewModel.cancelAlign() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("AlignCancel")
+        }
+    }
+
+    private func alignHint(_ viewModel: EditorViewModel) -> String {
+        if viewModel.alignSourceReference == nil {
+            return "Tap a face, cylinder or point on the body to move"
+        } else {
+            return "Tap the target face, cylinder or point on another body"
+        }
     }
 
     private func shellBar(_ viewModel: EditorViewModel) -> some View {
@@ -1282,12 +1374,16 @@ struct EditorView: View {
                         shellBar(viewModel)
                     } else if case .pickingDeleteFaces = viewModel.mode {
                         deleteFaceBar(viewModel)
+                    } else if case .pickingPatchEdges = viewModel.mode {
+                        patchBar(viewModel)
                     } else if case .pickingReplaceFace = viewModel.mode {
                         replaceFaceBar(viewModel)
                     } else if case .pickingAxisReferences = viewModel.mode {
                         axisBar(viewModel)
                     } else if case .pickingPlaneReferences = viewModel.mode {
                         planeBar(viewModel)
+                    } else if case .aligning = viewModel.mode {
+                        alignBar(viewModel)
                     } else if viewModel.mode.sketchTool == .offset {
                         sketchOffsetBar(viewModel)
                     } else {
@@ -1514,7 +1610,24 @@ struct EditorView: View {
                 }
             }
             .overlay(alignment: .top) {
-                if let tool = viewModel.pendingCreateTool {
+                if viewModel.isIsolateActive, let count = viewModel.isolatedBodyIDs?.count {
+                    HStack(spacing: 8) {
+                        Image(systemName: "eye.slash.fill")
+                            .foregroundStyle(.orange)
+                        Text("Isolate Mode (\(count) \(count == 1 ? "body" : "bodies"))")
+                            .font(.subheadline.weight(.medium))
+                        Button("Exit Isolate") {
+                            viewModel.exitIsolate()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("ExitIsolateBanner")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.top, 10)
+                } else if let tool = viewModel.pendingCreateTool {
                     // Modify group armed (pick the operation, then the region).
                     statusPill(
                         icon: "cube",

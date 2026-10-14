@@ -50,6 +50,22 @@ nonisolated enum LineMath {
         guard abs(denom) > 1e-6 else { return nil }
         return (a * e - b * d) / denom
     }
+
+    /// Shortest distance from a 3D line segment to a ray.
+    static func distanceBetween(segmentA: SIMD3<Float>, segmentB: SIMD3<Float>, and ray: Ray) -> Float {
+        let ab = segmentB - segmentA
+        let len = simd_length(ab)
+        guard len > 1e-6 else {
+            let tRay = max(0, simd_dot(segmentA - ray.origin, ray.direction))
+            return simd_length(segmentA - ray.point(at: tRay))
+        }
+        let dir = ab / len
+        let param = closestParamOnLine(origin: segmentA, direction: dir, to: ray) ?? (len * 0.5)
+        let clampedT = max(0, min(len, param))
+        let ptOnSeg = segmentA + dir * clampedT
+        let tRay = max(0, simd_dot(ptOnSeg - ray.origin, ray.direction))
+        return simd_length(ptOnSeg - ray.point(at: tRay))
+    }
 }
 
 nonisolated enum Matrices {

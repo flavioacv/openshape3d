@@ -22,6 +22,11 @@ struct ExtrudeGizmoOverlay: View {
         var isValid: Bool
     }
 
+    private var isBlendArrow: Bool {
+        if case .pickingBlendEdges = viewModel.mode { return true }
+        return false
+    }
+
     private var arrowAnchor: ArrowAnchor? {
         // `pullArrowState`, NOT `scene.pullArrow`: reading `scene` here made
         // every camera tick re-assemble the whole viewport scene (review S2).
@@ -34,9 +39,8 @@ struct ExtrudeGizmoOverlay: View {
         guard let p0 = cam.worldToScreenPoint(o) else { return nil }
         let p1 = cam.worldToScreenPoint(o + d)
         let dir = screenDir(from: p0, to: p1)
-        // Float off the cap — shares the grab-region offset so the touch target
-        // sits exactly under the drawn symbol.
-        let float = ViewportCoordinator.pullHandleScreenOffset
+        // Float off the cap for extrusions, but sit directly on the edge for chamfer/fillet
+        let float = isBlendArrow ? 0 : ViewportCoordinator.pullHandleScreenOffset
         return ArrowAnchor(
             point: CGPoint(x: p0.x + dir.x * float, y: p0.y + dir.y * float),
             dir: dir, isValid: arrow.isValid
@@ -89,11 +93,11 @@ struct ExtrudeGizmoOverlay: View {
             ZStack {
                 // Dark backing (a hair larger) → crisp outline like Shapr3D.
                 symbolImage.foregroundStyle(Color(white: 0.08))
-                    .scaleEffect(1.18)
-                symbolImage.foregroundStyle(anchor.isValid ? Color(red: 0.20, green: 0.52, blue: 1.0)
+                    .scaleEffect(1.22)
+                symbolImage.foregroundStyle(anchor.isValid ? Color(red: 0.16, green: 0.55, blue: 1.0)
                                                            : Color(red: 0.90, green: 0.26, blue: 0.26))
             }
-            .rotationEffect(.radians(anchor.dir.angle + .pi / 2))
+            .rotationEffect(isBlendArrow ? .zero : .radians(anchor.dir.angle + .pi / 2))
             .position(anchor.point)
             .allowsHitTesting(false)
             // A separate, un-rotated invisible marker at the exact grab point —
@@ -110,8 +114,13 @@ struct ExtrudeGizmoOverlay: View {
     }
 
     private var symbolImage: some View {
-        Image(systemName: "arrow.up.and.down")
-            .font(.system(size: 30, weight: .bold))
+        if isBlendArrow {
+            Image(systemName: "arrow.up.left.and.down.right")
+                .font(.system(size: 24, weight: .bold))
+        } else {
+            Image(systemName: "arrow.up.and.down")
+                .font(.system(size: 30, weight: .bold))
+        }
     }
 
     /// Unit screen-space direction from `p0` toward `p1` (defaults to straight
@@ -131,7 +140,7 @@ struct ExtrudeGizmoOverlay: View {
         } else {
             // Extent menu stacked above the value pill, centred on the arrow.
             VStack(spacing: 5) {
-                if !label.isDiameter {
+                if !label.isDiameter && !isBlendArrow {
                     Menu {
                         Button { viewModel.setExtrudeSymmetric(false) } label: {
                             Label("Total", systemImage: label.symmetric ? "" : "checkmark")
@@ -251,6 +260,8 @@ private struct ExtrudeArrowField: View {
                 // Seed with the numeric part of the current label.
                 text = (viewModel.extrudeArrowLabel?.text ?? "")
                     .replacingOccurrences(of: "⌀ ", with: "")
+                    .replacingOccurrences(of: "⌒ ", with: "")
+                    .replacingOccurrences(of: "⟍ ", with: "")
                     .replacingOccurrences(
                         of: " " + AppSettings.shared.unit.symbol, with: "")
                 if usingSystemKeyboard { focused = true } else { padOpen = true }

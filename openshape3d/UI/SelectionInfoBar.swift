@@ -59,6 +59,21 @@ struct SelectionInfoBar: View {
                         .monospacedDigit()
                 }
             }
+            if !viewModel.selection.isEmpty || viewModel.isIsolated {
+                Divider().frame(height: 16)
+                Button {
+                    viewModel.toggleIsolateSelection()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: viewModel.isIsolated ? "eye.slash.fill" : "eye.fill")
+                        Text(viewModel.isIsolated ? "Show All" : "Isolate")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(viewModel.isIsolated ? Color.orange : Color.blue)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("IsolateSelectionButton")
+            }
         }
         .lineLimit(1)
     }

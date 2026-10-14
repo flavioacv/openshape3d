@@ -462,7 +462,18 @@ struct EditorView: View {
             get: { viewModel.blendValue },
             set: { viewModel.blendValue = max(0, $0) })
         return AdaptiveBar(style: .capsule, spacing: 12) {
-            Image(systemName: kind == .chamfer ? "square.on.circle" : "circle.circle")
+            Picker("Mode", selection: Binding(
+                get: { kind },
+                set: { viewModel.switchBlendKind($0) }
+            )) {
+                Text("Fillet").tag(BlendKind.fillet)
+                Text("Chamfer").tag(BlendKind.chamfer)
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .accessibilityIdentifier("BlendKindPicker")
+
+            Divider().frame(height: 20)
             // When the kernel refused the current size/pick, say WHY — the
             // typed diagnostic replaces the count until the preview is valid
             // again. Concrete color, not hierarchical .secondary (gotcha 10).

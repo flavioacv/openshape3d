@@ -4436,19 +4436,55 @@ final class EditorViewModel {
         return true
     }
 
+    private var lastBlendSnapTick: Double?
+
     /// `delta` is world mm along the arrow's pointing direction (into the body).
     func updateBlendDrag(delta: Double) {
         guard let start = blendDragStartValue else { return }
-        var next = max(0, start + delta)
+        let raw = start + delta
+        if case .pickingBlendEdges(let currentKind) = mode {
+            if raw < -0.2 {
+                // Crossing zero into the opposite direction switches kind (Shapr3D parity)
+                let oppositeKind: BlendKind = (currentKind == .fillet) ? .chamfer : .fillet
+                mode = .pickingBlendEdges(oppositeKind)
+                blendDragStartValue = 0
+                blendValue = min(abs(raw), blendDragMax ?? Double.infinity)
+                HapticFeedback.snapOccurred()
+                return
+            }
+        }
+        var next = max(0, raw)
         // Clamp to what the kernel can actually build, so the drag never
         // enters the range Apply would refuse.
         if let cap = blendDragMax { next = min(next, cap) }
+
+        // Shapr3D Parity: Magnetic snapping on round intervals (0.5 mm, 1.0 mm, 2.0 mm)
+        let step: Double = next >= 10.0 ? 2.0 : (next >= 4.0 ? 1.0 : 0.5)
+        let candidate = (next / step).rounded() * step
+        if abs(next - candidate) < 0.08 {
+            if lastBlendSnapTick != candidate {
+                HapticFeedback.snapOccurred()
+                lastBlendSnapTick = candidate
+            }
+            next = candidate
+        } else {
+            lastBlendSnapTick = nil
+        }
+
         blendValue = next   // didSet recomputes the preview
+    }
+
+    /// Switch between Fillet and Chamfer while preserving selected edges and size
+    func switchBlendKind(_ newKind: BlendKind) {
+        guard case .pickingBlendEdges(let oldKind) = mode, oldKind != newKind else { return }
+        mode = .pickingBlendEdges(newKind)
+        updateBlendPreview()
     }
 
     func endBlendDrag() {
         blendDragStartValue = nil
         blendDragMax = nil
+        lastBlendSnapTick = nil
         // The gate may have skipped the last few frames, so the preview can be
         // one size behind the finger. Settle it before the user can commit.
         isDraggingBlendSize = false
@@ -4506,14 +4542,22 @@ final class EditorViewModel {
         // tap still means that one edge, as it always has.
         if let faceEdges = blendFaceEdges(
             body: body, hit: hit, ray: ray, nearest: nearest, edges: edges) {
-            // Toggle the face's edges as a unit: all selected → deselect all.
-            if faceEdges.allSatisfy({ isSelected($0) != nil }) {
-                for edge in faceEdges {
-                    if let idx = isSelected(edge) { blendSelectedEdges.remove(at: idx) }
+            if !selectionAdditive {
+                if faceEdges.allSatisfy({ isSelected($0) != nil }) {
+                    blendSelectedEdges.removeAll()
+                } else {
+                    blendSelectedEdges = faceEdges
                 }
             } else {
-                for edge in faceEdges where isSelected(edge) == nil {
-                    blendSelectedEdges.append(edge)
+                // Toggle the face's edges as a unit: all selected → deselect all.
+                if faceEdges.allSatisfy({ isSelected($0) != nil }) {
+                    for edge in faceEdges {
+                        if let idx = isSelected(edge) { blendSelectedEdges.remove(at: idx) }
+                    }
+                } else {
+                    for edge in faceEdges where isSelected(edge) == nil {
+                        blendSelectedEdges.append(edge)
+                    }
                 }
             }
             updateBlendPreview()
@@ -4525,14 +4569,25 @@ final class EditorViewModel {
         // so one tap blends the full rim. A straight edge is its own chain.
         let chain = EdgeTopology.smoothChain(containing: nearest, in: edges)
 
-        // Toggle the chain as a unit: fully selected → deselect it all.
-        if chain.allSatisfy({ isSelected($0) != nil }) {
-            for edge in chain {
-                if let idx = isSelected(edge) { blendSelectedEdges.remove(at: idx) }
+        if !selectionAdditive {
+            // Shapr3D Parity: Individual selection by default.
+            // Tapping an unselected edge replaces the selection with this edge/chain.
+            // Tapping an already selected edge clears it.
+            if chain.allSatisfy({ isSelected($0) != nil }) {
+                blendSelectedEdges.removeAll()
+            } else {
+                blendSelectedEdges = chain
             }
         } else {
-            for edge in chain where isSelected(edge) == nil {
-                blendSelectedEdges.append(edge)
+            // Toggle the chain as a unit: fully selected → deselect it all.
+            if chain.allSatisfy({ isSelected($0) != nil }) {
+                for edge in chain {
+                    if let idx = isSelected(edge) { blendSelectedEdges.remove(at: idx) }
+                }
+            } else {
+                for edge in chain where isSelected(edge) == nil {
+                    blendSelectedEdges.append(edge)
+                }
             }
         }
         updateBlendPreview()
@@ -5601,31 +5656,23 @@ final class EditorViewModel {
     /// tight (a thin wall at model-mode zoom is only a few points tall, and
     /// its centre must still read as the wall — CylinderGrowShotUITests),
     /// and limited to sharp dihedrals so tessellation seams never count.
-    static let edgeTapPoints: Double = 5
-    static let edgeTapMinimumDihedralDegrees: Float = 45
+    static let edgeTapPoints: Double = 16
+    static let edgeTapMinimumDihedralDegrees: Float = 15
 
     private func tapIsNearBodyEdge(hit: PickHit, body: Body) -> Bool {
-        // Only from a flat face: a tap on a curved wall is the wall (its
-        // rims are exactly where an edge-on view puts a wall tap, and the
-        // radial edit is what the wall means — CylinderGrowShotUITests).
-        // The native rim click observed 2026-09-13 was from the cap side.
-        if FaceTopology.smoothRegion(in: body.render, seedTriangle: hit.triangleIndex)?.isCurved == true {
-            return false
-        }
+        let isCurved = FaceTopology.smoothRegion(in: body.render, seedTriangle: hit.triangleIndex)?.isCurved == true
         let flattest = cos(Self.edgeTapMinimumDihedralDegrees * .pi / 180)
-        let sharp = EdgeTopology.selectableEdges(from: body.render).filter {
+        let edges = EdgeTopology.selectableEdges(from: body.render)
+        let sharp = edges.filter {
             simd_dot($0.normalA, $0.normalB) <= flattest
         }
         guard !sharp.isEmpty else { return false }
-        // Measured in WORLD units at the camera's current scale, never on
-        // screen: a screen-space test has no depth, and perspective draws a
-        // box's hidden bottom edges inward under its top face, where a tap
-        // on the face lands within a few points of them (PlanesUITests
-        // testSketchOnFaceThenExtrudeNewBody, 2026-09-13).
         let inverse = simd_inverse(body.transform.matrixFloat)
         let local4 = inverse * SIMD4(hit.worldPoint, 1)
         let local = SIMD3<Float>(local4.x, local4.y, local4.z)
-        let tolerance = Float(Self.edgeTapPoints * worldPerPoint / max(body.transform.scale, 1e-9))
+        // Shapr3D touch-friendly cone: 16 points for planar faces; 10 points on curved faces to allow selecting fillet edges without breaking wall drag
+        let points = isCurved ? (Self.edgeTapPoints * 0.65) : Self.edgeTapPoints
+        let tolerance = Float(points * worldPerPoint / max(body.transform.scale, 1e-9))
         return sharp.contains { Self.pointSegmentDistance(local, $0.start, $0.end) <= tolerance }
     }
 
@@ -7123,10 +7170,29 @@ final class EditorViewModel {
             )
             return
         }
-        if let hit = HitTester.pickBody(ray: ray, in: scene) {
+        if let hit = HitTester.pickBody(ray: ray, in: scene),
+           let body = session.document.body(with: hit.bodyID) {
             cancelTool()
             selection = [hit.bodyID]
-            if let body = session.document.body(with: hit.bodyID), body.primitive != nil {
+            // Shapr3D Parity: Double-tap on an edge selects the entire edge loop / tangent chain
+            if tapIsNearBodyEdge(hit: hit, body: body) {
+                beginBlend(.fillet)
+                blendValue = 0
+                let edges = EdgeTopology.selectableEdges(from: body.render)
+                let inverse = simd_inverse(body.transform.matrixFloat)
+                let local4 = inverse * SIMD4(hit.worldPoint, 1)
+                let localPoint = SIMD3<Float>(local4.x, local4.y, local4.z)
+                if let nearest = edges.min(by: {
+                    Self.pointSegmentDistance(localPoint, $0.start, $0.end) < Self.pointSegmentDistance(localPoint, $1.start, $1.end)
+                }) {
+                    let loop = findEdgeLoop(nearest: nearest, body: body, hit: hit, edges: edges)
+                    blendSelectedEdges = loop
+                    updateBlendPreview()
+                    HapticFeedback.commitOccurred()
+                    return
+                }
+            }
+            if body.primitive != nil {
                 mode = .editingPrimitive(hit.bodyID)
             } else {
                 mode = .selected(hit.bodyID)
@@ -7134,6 +7200,33 @@ final class EditorViewModel {
         } else {
             cameraControl?.fitScene()
         }
+    }
+
+    /// Finds the connected loop or tangent-continuous chain of edges (Shapr3D double-tap parity)
+    private func findEdgeLoop(
+        nearest: SelectableEdge,
+        body: Body,
+        hit: PickHit,
+        edges: [SelectableEdge]
+    ) -> [SelectableEdge] {
+        // 1. Try smooth / tangent continuous chain first (e.g. cylinder rims, fillet seams)
+        let smoothChain = EdgeTopology.smoothChain(containing: nearest, in: edges)
+        if smoothChain.count > 1 {
+            return smoothChain
+        }
+
+        // 2. Try planar face boundary loop (e.g. all 4 edges of a cube's face)
+        if let face = FaceTopology.planarFace(in: body.render, seedTriangle: hit.triangleIndex) {
+            let n = face.normal
+            let faceEdges = edges.filter { edge in
+                simd_dot(edge.normalA, n) > 0.9 || simd_dot(edge.normalB, n) > 0.9
+            }
+            if !faceEdges.isEmpty {
+                return faceEdges
+            }
+        }
+
+        return [nearest]
     }
 
     /// Shapr3D: a single tap on a body selects the planar face under it.
@@ -7223,6 +7316,7 @@ final class EditorViewModel {
             // already chosen; the info bar reads the edge count and length.
             if tapIsNearBodyEdge(hit: hit, body: body) {
                 beginBlend(.fillet)
+                blendValue = 0
                 handleBlendEdgeTap(ray: ray, kind: .fillet)
                 return
             }
@@ -7280,9 +7374,90 @@ final class EditorViewModel {
             return
         }
 
+        // Shapr3D Parity: Silhouette Edge Cone-Picking
+        // If ray missed the body faces by a few pixels against the background, check proximity to silhouette edges
+        if let edgeHit = nearestSilhouetteEdgeHit(ray: ray) {
+            cancelTool()
+            selection = [edgeHit.bodyID]
+            blendBodyID = edgeHit.bodyID
+            beginBlend(.fillet)
+            blendValue = 0
+            blendSelectedEdges = [edgeHit.edge]
+            updateBlendPreview()
+            HapticFeedback.snapOccurred()
+            return
+        }
+
         cancelTool()
         selection.removeAll()
         mode = .idle
+    }
+
+    private struct SilhouetteEdgeHit {
+        var bodyID: BodyID
+        var edge: SelectableEdge
+        var distance: Double
+    }
+
+    /// Shapr3D cone-picking: captures nearby silhouette edges when tapping in the empty canvas just outside a solid
+    private func nearestSilhouetteEdgeHit(ray: Ray) -> SilhouetteEdgeHit? {
+        let thresholdPoints: Float = 18.0
+        let thresholdWorld = thresholdPoints * Float(worldPerPoint)
+        var bestHit: SilhouetteEdgeHit?
+        var minDistance: Float = thresholdWorld
+
+        for body in session.document.bodies where !body.isHidden {
+            let edges = EdgeTopology.selectableEdges(from: body.render)
+            let matrix = body.transform.matrixFloat
+            for edge in edges {
+                let w0 = matrix * SIMD4(edge.start, 1)
+                let w1 = matrix * SIMD4(edge.end, 1)
+                let p0 = SIMD3<Float>(w0.x, w0.y, w0.z)
+                let p1 = SIMD3<Float>(w1.x, w1.y, w1.z)
+                let dist = LineMath.distanceBetween(segmentA: p0, segmentB: p1, and: ray)
+                if dist < minDistance {
+                    minDistance = dist
+                    bestHit = SilhouetteEdgeHit(bodyID: body.id, edge: edge, distance: Double(dist))
+                }
+            }
+        }
+        return bestHit
+    }
+
+    // MARK: - Isolate Selection (Shapr3D Focus Mode)
+
+    var isIsolated = false
+    private var hiddenBeforeIsolate: Set<BodyID> = []
+
+    func toggleIsolateSelection() {
+        guard !selection.isEmpty || isIsolated else { return }
+        var cmds: [any DocumentCommand] = []
+        if isIsolated {
+            // Restore visibility of all bodies
+            for body in session.document.bodies {
+                let shouldHide = hiddenBeforeIsolate.contains(body.id)
+                if body.isHidden != shouldHide {
+                    cmds.append(SetItemVisibilityCommand(item: .body(body.id), isHidden: shouldHide))
+                }
+            }
+            hiddenBeforeIsolate.removeAll()
+            isIsolated = false
+        } else {
+            // Isolate selected bodies
+            hiddenBeforeIsolate = Set(session.document.bodies.filter { $0.isHidden }.map { $0.id })
+            for body in session.document.bodies {
+                let shouldHide = !selection.contains(body.id)
+                if body.isHidden != shouldHide {
+                    cmds.append(SetItemVisibilityCommand(item: .body(body.id), isHidden: shouldHide))
+                }
+            }
+            isIsolated = true
+        }
+        if !cmds.isEmpty {
+            session.perform(CompositeCommand(title: isIsolated ? "Isolate" : "Show All", commands: cmds))
+        }
+        HapticFeedback.commitOccurred()
+        session.save()
     }
 
     // MARK: - Multi-select & area select (plan §B13, spec §8.1–8.2)
@@ -8649,6 +8824,15 @@ final class EditorViewModel {
 
     /// The editable value pill riding the extrude/diameter arrow, or nil.
     var extrudeArrowLabel: ExtrudeArrowLabel? {
+        if case .pickingBlendEdges(let kind) = mode, let arrow = pullArrowState {
+            let unit = AppSettings.shared.unit
+            let prefix = kind == .chamfer ? "⟍ " : "⌒ "
+            let o = SIMD3<Double>(Double(arrow.origin.x), Double(arrow.origin.y), Double(arrow.origin.z))
+            return ExtrudeArrowLabel(
+                world: o, text: prefix + unit.compactLengthString(fromMM: blendValue),
+                isDiameter: false, symmetric: false
+            )
+        }
         guard let context = toolContext, case .extrude(let distance) = context.kind else { return nil }
         let centroid = context.plane.toWorld(context.profile.centroid)
         // Anchor the pill at the arrow's midpoint (Shapr3D centres it on the
@@ -8679,11 +8863,14 @@ final class EditorViewModel {
     /// (Enter commits the feature, matching the bottom bar).
     func commitExtrudeArrowEdit(_ text: String) {
         defer { editingExtrudeArrow = false }
-        guard let typed = ExpressionEvaluator.evaluate(text),
-              let context = toolContext, case .extrude = context.kind
-        else { return }
-        // The pill shows and edits the DISPLAY unit; the tool works in mm.
+        guard let typed = ExpressionEvaluator.evaluate(text) else { return }
         let value = AppSettings.shared.unit.mm(fromDisplay: typed)
+        if case .pickingBlendEdges = mode {
+            blendValue = max(0, value)
+            return
+        }
+        guard let context = toolContext, case .extrude = context.kind else { return }
+        // The pill shows and edits the DISPLAY unit; the tool works in mm.
         if let cyl = context.cylinderFace {
             setExtrudeDistance(value / 2 - cyl.radius)
         } else {
@@ -9868,10 +10055,34 @@ final class EditorViewModel {
             } else {
                 raw = toolDragStartValue + screenDeltaWorld
             }
-            // Snap to 0.5 steps, like the sketch grid; clamp sub-pixel noise to 0.05 mm
-            let snapped = (raw / 0.5).rounded() * 0.5
-            let freeGranularity = (raw * 20).rounded() / 20
-            let value = abs(raw - snapped) < 0.15 ? snapped : freeGranularity
+            // Check geometry target snapping: if ray points to a face/vertex on another body, snap extrude height to it
+            var geoSnapDistance: Double?
+            if let hit = HitTester.pickBody(ray: ray, in: scene),
+               hit.bodyID != context.sourceBody {
+                let originF = SIMD3<Float>(Float(context.plane.origin.x), Float(context.plane.origin.y), Float(context.plane.origin.z))
+                let normalF = SIMD3<Float>(Float(context.plane.normal.x), Float(context.plane.normal.y), Float(context.plane.normal.z))
+                let height = Double(simd_dot(hit.worldPoint - originF, normalF))
+                if abs(raw - height) < 1.2 {
+                    geoSnapDistance = height
+                }
+            }
+
+            let value: Double
+            if let snapTarget = geoSnapDistance {
+                value = snapTarget
+                HapticFeedback.snapOccurred()
+            } else {
+                // Snap to 0.5 steps, like the sketch grid; clamp sub-pixel noise to 0.05 mm
+                let snapped = (raw / 0.5).rounded() * 0.5
+                let freeGranularity = (raw * 20).rounded() / 20
+                if abs(raw - snapped) < 0.15 {
+                    value = snapped
+                    HapticFeedback.snapOccurred()
+                } else {
+                    value = freeGranularity
+                }
+            }
+
             if case .offsetPlane = context.kind {
                 setOffsetPlaneDistance(value)
             } else {

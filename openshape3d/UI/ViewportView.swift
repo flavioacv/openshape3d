@@ -369,9 +369,38 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
             let len = (dx * dx + dy * dy).squareRoot()
             if len > 0.5 { ux = dx / len; uy = dy / len }
         }
-        let handle = CGPoint(x: p0.x + ux * Self.pullHandleScreenOffset,
-                             y: p0.y + uy * Self.pullHandleScreenOffset)
+        let isBlend: Bool
+        if case .pickingBlendEdges = viewModel.mode { isBlend = true } else { isBlend = false }
+        let offset = isBlend ? 0 : Self.pullHandleScreenOffset
+        let handle = CGPoint(x: p0.x + ux * offset,
+                             y: p0.y + uy * offset)
         return hypot(point.x - handle.x, point.y - handle.y) <= Self.pullHandleTouchRadius
+    }
+
+    private func distanceToSegment2D(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len2 = dx * dx + dy * dy
+        guard len2 > 1e-6 else { return hypot(p.x - a.x, p.y - a.y) }
+        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
+        let projX = a.x + t * dx
+        let projY = a.y + t * dy
+        return hypot(p.x - projX, p.y - projY)
+    }
+
+    private func hitsBlendEdgeScreen(point: CGPoint) -> Bool {
+        guard case .pickingBlendEdges = viewModel.mode,
+              let bodyID = viewModel.blendBodyID,
+              let body = viewModel.session.document.body(with: bodyID) else { return false }
+        let matrix = body.transform.matrixFloat
+        for edge in viewModel.blendSelectedEdges {
+            let w0 = matrix * SIMD4(edge.start, 1)
+            let w1 = matrix * SIMD4(edge.end, 1)
+            guard let s0 = worldToScreenPoint(SIMD3<Double>(Double(w0.x), Double(w0.y), Double(w0.z))),
+                  let s1 = worldToScreenPoint(SIMD3<Double>(Double(w1.x), Double(w1.y), Double(w1.z))) else { continue }
+            let d = distanceToSegment2D(point, s0, s1)
+            if d <= 32 { return true }
+        }
+        return false
     }
 
     /// World-mm drag component along the blend arrow's on-screen direction —
@@ -506,11 +535,11 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
             return true
         }
 
-        // Chamfer/Fillet pick: grabbing the edge arrow scrubs the blend size
+        // Chamfer/Fillet pick: grabbing the edge arrow or edge scrubs the blend size
         // (drag into the body = bigger, Shapr3D §4.3); anywhere else orbits.
         if case .pickingBlendEdges = viewModel.mode {
-            if let arrow = viewModel.pullArrowState,
-               hitsPullArrowScreen(point: point, arrow: arrow),
+            let hitsHandle = viewModel.pullArrowState.map { hitsPullArrowScreen(point: point, arrow: $0) } ?? false
+            if (hitsHandle || hitsBlendEdgeScreen(point: point)),
                viewModel.beginBlendDrag() {
                 blendDragActive = true
                 return true

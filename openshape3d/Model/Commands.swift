@@ -117,13 +117,15 @@ struct BooleanCommand: DocumentCommand {
     let toolBefore: Body
     /// Result body — same ID as the target, world-space mesh, identity transform.
     let result: Body
+    let keepTool: Bool
 
-    init(kind: BooleanKind, targetBefore: Body, toolIndex: Int, toolBefore: Body, result: Body) {
+    init(kind: BooleanKind, targetBefore: Body, toolIndex: Int, toolBefore: Body, result: Body, keepTool: Bool = false) {
         self.title = kind.rawValue.capitalized
         self.targetBefore = targetBefore
         self.toolIndex = toolIndex
         self.toolBefore = toolBefore
         self.result = result
+        self.keepTool = keepTool
     }
 
     func apply(to document: inout DesignDocument) {
@@ -132,7 +134,9 @@ struct BooleanCommand: DocumentCommand {
             updated.meshRevision = document.nextRevision()
             document.bodies[index] = updated
         }
-        document.bodies.removeAll { $0.id == toolBefore.id }
+        if !keepTool {
+            document.bodies.removeAll { $0.id == toolBefore.id }
+        }
     }
 
     func revert(in document: inout DesignDocument) {
@@ -141,10 +145,12 @@ struct BooleanCommand: DocumentCommand {
             restored.meshRevision = document.nextRevision()
             document.bodies[index] = restored
         }
-        let index = min(toolIndex, document.bodies.count)
-        var restoredTool = toolBefore
-        restoredTool.meshRevision = document.nextRevision()
-        document.bodies.insert(restoredTool, at: index)
+        if !keepTool {
+            let index = min(toolIndex, document.bodies.count)
+            var restoredTool = toolBefore
+            restoredTool.meshRevision = document.nextRevision()
+            document.bodies.insert(restoredTool, at: index)
+        }
     }
 }
 

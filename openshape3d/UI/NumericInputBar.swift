@@ -26,6 +26,11 @@ struct NumericInputBar: View {
     @State private var extrudeDistanceUsesKeyboard = AppSettings.prefersSystemKeyboard
     @FocusState private var extrudeDistanceFocused: Bool
 
+    @State private var extrudeDraftAngleText: String = ""
+    @State private var extrudeDraftAnglePadOpen = false
+    @State private var extrudeDraftAngleUsesKeyboard = AppSettings.prefersSystemKeyboard
+    @FocusState private var extrudeDraftAngleFocused: Bool
+
     private func submitExtrudeDistance() {
         if applyExtrudeDistanceText() {
             viewModel.commitTool()
@@ -41,12 +46,26 @@ struct NumericInputBar: View {
         return String(format: "%g", (shown * 100).rounded() / 100)
     }
 
+    private func extrudeDraftAngleDisplay(_ degrees: Double?) -> String {
+        let val = degrees ?? 0
+        if abs(val - val.rounded()) < 1e-6 { return "\(Int(val.rounded()))°" }
+        return String(format: "%.1f°", val)
+    }
+
     /// Parse the field (arithmetic allowed) into the tool's distance.
     /// Returns false when the text is not a number, leaving the tool alone.
     @discardableResult
     private func applyExtrudeDistanceText() -> Bool {
         guard let typed = ExpressionEvaluator.evaluate(extrudeDistanceText) else { return false }
         viewModel.setExtrudeDistance(AppSettings.shared.unit.mm(fromDisplay: typed))
+        return true
+    }
+
+    @discardableResult
+    private func applyExtrudeDraftAngleText() -> Bool {
+        let cleaned = extrudeDraftAngleText.replacingOccurrences(of: "°", with: "").trimmingCharacters(in: .whitespaces)
+        guard let typed = ExpressionEvaluator.evaluate(cleaned) else { return false }
+        viewModel.setExtrudeDraftAngle(typed)
         return true
     }
 
@@ -498,7 +517,20 @@ struct NumericInputBar: View {
                 .fixedSize()
             BarHint("Drag from center to a vertex")
 
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Picker("Polygon Type", selection: Binding(
+                    get: { viewModel.polygonSides },
+                    set: { viewModel.polygonSides = $0 }
+                )) {
+                    Text("Triangle").tag(3)
+                    Text("Pentagon").tag(5)
+                    Text("Hexagon").tag(6)
+                    Text("Octagon").tag(8)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityIdentifier("PolygonTypePicker")
+
                 Text("Sides")
                     .font(.caption)
                     .foregroundStyle(.barLabel)
@@ -511,7 +543,7 @@ struct NumericInputBar: View {
                     ),
                     kind: .plain,
                     clamp: 3...64,
-                    width: 60,
+                    width: 50,
                     identifier: "PolygonSidesField"
                 )
                 Stepper(
@@ -645,6 +677,47 @@ struct NumericInputBar: View {
             // Concrete grey, not hierarchical `.secondary` — see `.barLabel`.
             .tint(context.symmetric ? Color.accentColor : .barLabel)
 
+            // Draft angle (Shapr3D taper): positive tapers inward, negative outward.
+            HStack(spacing: 4) {
+                Text("Draft")
+                    .font(.caption)
+                    .foregroundStyle(.barLabel)
+                    .fixedSize()
+                TextField("0°", text: $extrudeDraftAngleText)
+                    .keyboardType(.numbersAndPunctuation)
+                    .autocorrectionDisabled()
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 60)
+                    .focused($extrudeDraftAngleFocused)
+                    .onAppear { extrudeDraftAngleText = extrudeDraftAngleDisplay(context.draftAngle) }
+                    .onChange(of: viewModel.toolContext?.draftAngle) { _, new in
+                        if !extrudeDraftAngleFocused && !extrudeDraftAnglePadOpen {
+                            extrudeDraftAngleText = extrudeDraftAngleDisplay(new)
+                        }
+                    }
+                    .onSubmit {
+                        _ = applyExtrudeDraftAngleText()
+                    }
+                    .allowsHitTesting(extrudeDraftAngleUsesKeyboard)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if !extrudeDraftAngleUsesKeyboard { extrudeDraftAnglePadOpen = true }
+                    }
+                    .numericKeypad(
+                        isPresented: $extrudeDraftAnglePadOpen,
+                        text: $extrudeDraftAngleText,
+                        onCommit: {
+                            extrudeDraftAnglePadOpen = false
+                            _ = applyExtrudeDraftAngleText()
+                        },
+                        onSwitchToSystemKeyboard: {
+                            extrudeDraftAnglePadOpen = false
+                            extrudeDraftAngleUsesKeyboard = true
+                            extrudeDraftAngleFocused = true
+                        }
+                    )
+            }
+
             Spacer()
         } actions: {
             // Sketch profiles can revolve about one of their lines, sweep
@@ -680,6 +753,9 @@ struct NumericInputBar: View {
                         viewModel.errorMessage = "Couldn't read \"\(extrudeDistanceText)\" as a distance."
                         return
                     }
+                }
+                if extrudeDraftAngleFocused || extrudeDraftAngleText != extrudeDraftAngleDisplay(context.draftAngle) {
+                    _ = applyExtrudeDraftAngleText()
                 }
                 viewModel.commitTool()
             }

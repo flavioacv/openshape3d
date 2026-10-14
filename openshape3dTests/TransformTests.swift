@@ -198,4 +198,44 @@ final class TransformTests: XCTestCase {
         XCTAssertEqual(rotated.y, 1, accuracy: 1e-12)
         XCTAssertEqual(rotated.z, 0, accuracy: 1e-12)
     }
+
+    func testAlignRotationBetweenOppositeVectors() {
+        let a = SIMD3<Double>(0, 1, 0)
+        let b = SIMD3<Double>(0, -1, 0)
+        let helper: SIMD3<Double> = abs(a.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)
+        let q = simd_quatd(angle: .pi, axis: simd_normalize(simd_cross(a, helper)))
+        let rotated = q.act(a)
+        XCTAssertEqual(rotated.x, b.x, accuracy: 1e-6)
+        XCTAssertEqual(rotated.y, b.y, accuracy: 1e-6)
+        XCTAssertEqual(rotated.z, b.z, accuracy: 1e-6)
+    }
+
+    func testConcentricAlignmentMathCoaxial() {
+        let srcPt = SIMD3<Double>(10, 0, 0)
+        let srcDir = SIMD3<Double>(1, 0, 0)
+
+        let dstPt = SIMD3<Double>(0, 0, 20)
+        let dstDir = SIMD3<Double>(0, 0, 1)
+
+        let dot = simd_dot(srcDir, dstDir)
+        let targetDir = dot < 0 ? -dstDir : dstDir
+        let q = simd_quatd(from: srcDir, to: targetDir)
+
+        let newDir = q.act(srcDir)
+        XCTAssertEqual(newDir.x, dstDir.x, accuracy: 1e-6)
+        XCTAssertEqual(newDir.y, dstDir.y, accuracy: 1e-6)
+        XCTAssertEqual(newDir.z, dstDir.z, accuracy: 1e-6)
+
+        let rotatedSrcPt = q.act(srcPt)
+        let toDst = dstPt - rotatedSrcPt
+        let along = simd_dot(toDst, targetDir)
+        let closestOnAxis = dstPt - targetDir * along
+        let delta = closestOnAxis - rotatedSrcPt
+
+        let alignedPt = rotatedSrcPt + delta
+        let diff = alignedPt - dstPt
+        let offAxisDist = simd_length(diff - dstDir * simd_dot(diff, dstDir))
+        XCTAssertEqual(offAxisDist, 0, accuracy: 1e-6, "Source axis center must lie exactly on destination axis line")
+    }
 }
+

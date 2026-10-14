@@ -334,6 +334,11 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
     }
 
     func gestureDoubleTapped(at point: CGPoint) {
+        // Double-tapping the Orientation Cube resets the view to default/isometric (Shapr3D parity).
+        if let view, OrientationCube.rect(in: view.bounds.size).contains(point) {
+            viewModel.applyStandardView(.isometric)
+            return
+        }
         guard let ray = ray(at: point) else { return }
         viewModel.handle(.doubleTap(ray: ray))
     }

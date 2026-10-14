@@ -74,6 +74,85 @@ nonisolated enum KernelOps {
         return solid.transformed(by: transform)
     }
 
+    /// Draft (taper) extrude a profile by `taperAngle` degrees along the plane normal.
+    /// Positive draft angle tapers inward (contracts the end), negative expands.
+    static func draftExtrude(
+        profile: Profile,
+        holes: [Profile] = [],
+        in plane: SketchPlane,
+        distance: Double,
+        taperAngle: Double,
+        symmetric: Bool = false
+    ) -> Euclid.Mesh? {
+        guard abs(distance) > 1e-6 else { return Euclid.Mesh([]) }
+        if abs(taperAngle) < 1e-4 {
+            return extrude(profile: profile, holes: holes, in: plane, distance: distance, symmetric: symmetric)
+        }
+
+        let d = distance
+        let offsetDistance = -tan(taperAngle * .pi / 180) * d
+
+        func polyProfile(_ loop: [SIMD2<Double>], from src: Profile) -> Profile {
+            Profile(loop: loop, kind: .polygonal,
+                    sourceEntityIDs: src.sourceEntityIDs, edgeEntityIDs: src.edgeEntityIDs)
+        }
+
+        func circleProfile(center: SIMD2<Double>, radius: Double, from src: Profile) -> Profile {
+            let n = ProfileDetector.circleSegments
+            let loop = (0..<n).map { i -> SIMD2<Double> in
+                let a = Double(i) / Double(n) * 2 * Double.pi
+                return center + SIMD2(cos(a), sin(a)) * radius
+            }
+            return Profile(loop: loop, kind: .circle(center: center, radius: radius),
+                           sourceEntityIDs: src.sourceEntityIDs)
+        }
+
+        func sections(_ p: Profile, offsetBy dist: Double) -> (base: Profile, offset: Profile)? {
+            if case let .circle(center, radius) = p.kind {
+                let newRadius = radius + dist
+                guard newRadius > 1e-6 else { return nil }
+                return (p, circleProfile(center: center, radius: newRadius, from: p))
+            }
+            if p.segments.contains(where: { $0.mid != nil }),
+               let off = SegmentOffset.offset(p.segments, by: dist) {
+                func exact(_ segs: [Profile.Segment]) -> Profile {
+                    Profile(loop: SegmentOffset.loop(from: segs), kind: .polygonal,
+                            sourceEntityIDs: p.sourceEntityIDs, segments: segs,
+                            segmentEntityIDs: p.segmentEntityIDs)
+                }
+                return (exact(p.segments), exact(off))
+            }
+            guard let off = ProfileOffset.offsetLoop(p.loop, by: dist) else { return nil }
+            return (polyProfile(p.loop, from: p), polyProfile(off, from: p))
+        }
+
+        guard let outerS = sections(profile, offsetBy: offsetDistance) else { return nil }
+        var holeS: [(base: Profile, offset: Profile)] = []
+        for hole in holes {
+            guard let s = sections(hole, offsetBy: -offsetDistance) else { return nil }
+            holeS.append(s)
+        }
+
+        let n = simd_normalize(plane.normal)
+        func planeAt(_ t: Double) -> SketchPlane {
+            SketchPlane(origin: plane.origin + n * t,
+                        xAxis: plane.xAxis, yAxis: plane.yAxis)
+        }
+
+        let stack: [(plane: SketchPlane, offset: Bool)] = symmetric
+            ? [(planeAt(-d), true), (planeAt(0), false), (planeAt(d), true)]
+            : [(planeAt(0), false), (planeAt(d), true)]
+
+        func pick(_ s: (base: Profile, offset: Profile), _ useOffset: Bool) -> Profile {
+            useOffset ? s.offset : s.base
+        }
+
+        return SweepLoftKit.loft(profiles: stack.map { step in
+            (pick(outerS, step.offset), holeS.map { pick($0, step.offset) }, step.plane)
+        })
+    }
+
+
     /// Unsigned enclosed volume via the divergence theorem (mm³ for a closed
     /// outward-oriented mesh). Used to tell a REAL boolean overlap from mere
     /// coplanar sliver contact: two bodies sharing a flush wall can intersect

@@ -72,7 +72,7 @@ nonisolated enum WebHandoffError: LocalizedError, Equatable {
 // MARK: - Transport
 
 /// The one network call, injectable so tests never touch the network.
-protocol WebHandoffTransport: Sendable {
+nonisolated protocol WebHandoffTransport: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
 }
 

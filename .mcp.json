@@ -3,6 +3,10 @@
     "openshape3d": {
       "command": "python3",
       "args": ["scripts/mcp_openshape3d.py"]
+    },
+    "rea": {
+      "command": "npx",
+      "args": ["-y", "rea-agents@6.4.0", "mcp"]
     }
   }
 }

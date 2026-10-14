@@ -119,4 +119,31 @@ final class BooleanTests: XCTestCase {
         XCTAssertEqual(document.bodies[1].id, b.id, "Tool restored at its index")
         XCTAssertNotNil(document.body(with: a.id)?.primitive, "Target restored as primitive")
     }
+
+    func testBooleanCommandKeepToolPreservesToolBody() {
+        var document = DesignDocument()
+        let a = makeBody(.box(width: 4, depth: 4, height: 4), at: .zero)
+        let b = makeBody(.cylinder(radius: 1, height: 6), at: SIMD3(1, 0, 0))
+        document.bodies = [a, b]
+
+        let mesh = KernelOps.boolean(.subtract, target: a, tool: b)
+        let result = Body(
+            id: a.id, name: a.name, transform: .identity,
+            primitive: nil, euclidMesh: mesh, revision: 0
+        )
+        let command = BooleanCommand(
+            kind: .subtract, targetBefore: a, toolIndex: 1, toolBefore: b, result: result, keepTool: true
+        )
+
+        command.apply(to: &document)
+        XCTAssertEqual(document.bodies.count, 2, "Tool body is preserved when keepTool is true")
+        XCTAssertEqual(document.bodies[0].id, a.id)
+        XCTAssertEqual(document.bodies[1].id, b.id)
+
+        command.revert(in: &document)
+        XCTAssertEqual(document.bodies.count, 2)
+        XCTAssertEqual(document.bodies[1].id, b.id)
+        XCTAssertNotNil(document.body(with: a.id)?.primitive, "Target restored")
+    }
 }
+

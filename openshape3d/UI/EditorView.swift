@@ -842,6 +842,13 @@ struct EditorView: View {
             icon: "cursorarrow.and.square.on.square.dashed",
             text: "Drag to select"
         ) {
+            Button(viewModel.areaSelectFilterTitle) {
+                viewModel.cycleAreaSelectFilter()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .keyboardShortcut(.tab)
+            .accessibilityIdentifier("SelectFilterCycle")
             Button("Bodies") {
                 viewModel.toggleAreaSelectBodies()
             }
@@ -1644,6 +1651,17 @@ struct EditorView: View {
                         icon: "square.on.square",
                         text: "Tap the second body to \(kind.rawValue)"
                     ) {
+                        Button {
+                            viewModel.booleanKeepTool.toggle()
+                        } label: {
+                            Label("Keep Tool", systemImage: "plus.square.on.square")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(viewModel.booleanKeepTool ? Color.blue : Color.secondary)
+                        .accessibilityIdentifier("BooleanKeepToolButton")
+                        .accessibilityValue(viewModel.booleanKeepTool ? "on" : "off")
+
                         Button("Cancel") {
                             viewModel.cancelBooleanPicking()
                         }
@@ -1796,10 +1814,10 @@ struct EditorView: View {
                     }
                 } else if case .aligning = viewModel.mode {
                     statusPill(
-                        icon: "point.3.connected.trianglepath.dotted",
+                        icon: "arrow.triangle.merge",
                         text: viewModel.transformPickPoints.isEmpty
-                            ? "Tap a point on the body to move"
-                            : "Tap the destination point"
+                            ? "Tap a cylinder, face or point to move"
+                            : "Tap the target cylinder, face or point"
                     ) {
                         Button("Cancel") {
                             viewModel.cancelAlign()

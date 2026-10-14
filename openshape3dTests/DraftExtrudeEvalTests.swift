@@ -9,6 +9,7 @@
 
 import XCTest
 import simd
+import Euclid
 @testable import openshape3d
 
 final class DraftExtrudeEvalTests: XCTestCase {
@@ -343,4 +344,35 @@ final class DraftExtrudeEvalTests: XCTestCase {
         XCTAssertEqual(walls(of: outerRect), 4, "the outer walls keep the outer entity")
         XCTAssertTrue(names.values.allSatisfy { $0.creator == draft })
     }
+
+    func testKernelOpsDraftExtrudeProducesFrustumMesh() {
+        let loop = [
+            SIMD2<Double>(-20, -20),
+            SIMD2<Double>(20, -20),
+            SIMD2<Double>(20, 20),
+            SIMD2<Double>(-20, 20)
+        ]
+        let profile = Profile(loop: loop, kind: .polygonal, sourceEntityIDs: [UUID()])
+        let mesh = KernelOps.draftExtrude(
+            profile: profile,
+            holes: [],
+            in: .ground,
+            distance: 20,
+            taperAngle: 10,
+            symmetric: false
+        )
+        XCTAssertNotNil(mesh, "KernelOps.draftExtrude returns a mesh")
+        guard let mesh else { return }
+        XCTAssertFalse(mesh.polygons.isEmpty)
+        XCTAssertTrue(mesh.isWatertight)
+
+        let off = 20 * tan(10 * Double.pi / 180)
+        let topSide = 40 - 2 * off
+        let A1 = 40.0 * 40.0
+        let A2 = topSide * topSide
+        let want = 20.0 / 3.0 * (A1 + A2 + (A1 * A2).squareRoot())
+        let vol = KernelOps.volume(of: mesh)
+        XCTAssertEqual(vol, want, accuracy: 2.0, "KernelOps.draftExtrude volume matches analytic frustum")
+    }
 }
+

@@ -3521,10 +3521,34 @@ final class EditorViewModel {
 
     // MARK: - Translate (spec §5.2) & Align (spec §5.5 v1)
 
+    enum AlignReference {
+        case point(worldPoint: SIMD3<Double>, bodyID: BodyID)
+        case cylinder(axisPoint: SIMD3<Double>, axisDir: SIMD3<Double>, radius: Double, bodyID: BodyID, localAxisPoint: SIMD3<Double>, localAxisDir: SIMD3<Double>)
+        case plane(origin: SIMD3<Double>, normal: SIMD3<Double>, bodyID: BodyID, localOrigin: SIMD3<Double>, localNormal: SIMD3<Double>)
+
+        var bodyID: BodyID {
+            switch self {
+            case .point(_, let id): return id
+            case .cylinder(_, _, _, let id, _, _): return id
+            case .plane(_, _, let id, _, _): return id
+            }
+        }
+
+        var markerPoint: SIMD3<Double> {
+            switch self {
+            case .point(let p, _): return p
+            case .cylinder(let p, _, _, _, _, _): return p
+            case .plane(let p, _, _, _, _): return p
+            }
+        }
+    }
+
     /// Source point picked so far for Translate/Align (marker + pill state).
     var transformPickPoints: [SIMD3<Double>] = []
     /// Body that moves in an Align (owner of the first tapped snap point).
     private var alignSourceBody: BodyID?
+    /// Source geometry reference picked for Align (cylinder axis, plane, or point).
+    private var alignSourceReference: AlignReference?
 
     func beginTranslatePick() {
         guard !selection.isEmpty else { return }
@@ -3660,6 +3684,7 @@ final class EditorViewModel {
         scaleEntryActive = false
         transformPickPoints = []
         alignSourceBody = nil
+        alignSourceReference = nil
         selection.removeAll()
         mode = .aligning
     }
@@ -3667,6 +3692,7 @@ final class EditorViewModel {
     func cancelAlign() {
         transformPickPoints = []
         alignSourceBody = nil
+        alignSourceReference = nil
         if case .aligning = mode {
             mode = .idle
         }
@@ -3758,35 +3784,125 @@ final class EditorViewModel {
         )
     }
 
-    /// Align: tap a snap point on the body that moves, then the destination
-    /// point on another body; the first body translates so they coincide.
+    private static func alignRotationBetween(_ a: SIMD3<Double>, _ b: SIMD3<Double>) -> simd_quatd {
+        let u = simd_normalize(a)
+        let v = simd_normalize(b)
+        let dot = simd_dot(u, v)
+        if dot > 1 - 1e-12 {
+            return simd_quatd(angle: 0, axis: SIMD3(1, 0, 0))
+        }
+        if dot < -1 + 1e-12 {
+            let helper: SIMD3<Double> = abs(u.x) < 0.9 ? SIMD3(1, 0, 0) : SIMD3(0, 1, 0)
+            return simd_quatd(angle: .pi, axis: simd_normalize(simd_cross(u, helper)))
+        }
+        return simd_quatd(from: u, to: v)
+    }
+
+    private func alignReference(at ray: Ray, excluding: BodyID? = nil) -> AlignReference? {
+        if let hit = HitTester.pickBody(ray: ray, in: scene),
+           hit.bodyID != excluding,
+           let body = session.document.body(with: hit.bodyID) {
+            // 1. Testa se é uma face cilíndrica (furo ou pino)
+            if let cyl = FaceTopology.cylindricalFace(in: body.render, seedTriangle: hit.triangleIndex) {
+                let worldAxisPt = body.transform.applying(to: cyl.axisPoint)
+                let worldAxisDir = simd_normalize(body.transform.rotation.act(cyl.axisDir))
+                return .cylinder(
+                    axisPoint: worldAxisPt,
+                    axisDir: worldAxisDir,
+                    radius: cyl.radius,
+                    bodyID: body.id,
+                    localAxisPoint: cyl.axisPoint,
+                    localAxisDir: cyl.axisDir
+                )
+            }
+            // 2. Testa se é uma face plana
+            if let planar = FaceTopology.planarFace(in: body.render, seedTriangle: hit.triangleIndex) {
+                let localNormD = SIMD3<Double>(Double(planar.normal.x), Double(planar.normal.y), Double(planar.normal.z))
+                let worldOrigin = body.transform.applying(to: planar.origin)
+                let worldNormal = simd_normalize(body.transform.rotation.act(localNormD))
+                return .plane(
+                    origin: worldOrigin,
+                    normal: worldNormal,
+                    bodyID: body.id,
+                    localOrigin: planar.origin,
+                    localNormal: localNormD
+                )
+            }
+            // 3. Ponto da superfície no corpo
+            let p = SIMD3<Double>(Double(hit.worldPoint.x), Double(hit.worldPoint.y), Double(hit.worldPoint.z))
+            return .point(worldPoint: p, bodyID: body.id)
+        }
+        // Fallback: vértice mais próximo
+        if let vHit = nearestBodyVertex(to: ray, excluding: excluding) {
+            return .point(worldPoint: vHit.point, bodyID: vHit.bodyID)
+        }
+        return nil
+    }
+
+    /// Align: tap a cylinder, planar face or point on the body that moves, then the
+    /// destination on another body; the first body aligns (concentric, coplanar, or coincidental).
     private func handleAlignTap(ray: Ray) {
-        if alignSourceBody == nil {
-            guard let hit = nearestBodyVertex(to: ray) else { return }
-            alignSourceBody = hit.bodyID
-            transformPickPoints = [hit.point]
+        if alignSourceReference == nil {
+            guard let ref = alignReference(at: ray) else { return }
+            alignSourceReference = ref
+            alignSourceBody = ref.bodyID
+            transformPickPoints = [ref.markerPoint]
             return
         }
-        guard let source = alignSourceBody,
-              let anchor = transformPickPoints.first,
-              let body = session.document.body(with: source)
+        guard let source = alignSourceReference,
+              let body = session.document.body(with: source.bodyID)
         else {
             cancelAlign()
             return
         }
-        guard let hit = nearestBodyVertex(to: ray, excluding: source) else { return }
+        guard let target = alignReference(at: ray, excluding: source.bodyID) else { return }
         transformPickPoints = []
         alignSourceBody = nil
-        let delta = hit.point - anchor
-        guard simd_length(delta) > 1e-9 else {
-            mode = .idle
-            return
+        alignSourceReference = nil
+
+        var newTransform = body.transform
+
+        switch (source, target) {
+        case let (.cylinder(srcPt, srcDir, _, _, srcLocalPt, _),
+                  .cylinder(dstPt, dstDir, _, _, _, _)):
+            // Alinhamento concêntrico/coaxial (parafuso no furo, pino no eixo):
+            let dot = simd_dot(srcDir, dstDir)
+            let targetDir = dot < 0 ? -dstDir : dstDir
+            let rotDelta = Self.alignRotationBetween(srcDir, targetDir)
+            let finalRot = simd_normalize(rotDelta * body.transform.rotation)
+            newTransform.rotation = finalRot
+
+            // Ponto local rotacionado no espaço do corpo:
+            let rotatedLocalPt = finalRot.act(srcLocalPt * body.transform.scale)
+            // Projeção do ponto do eixo destino mais próximo do centro fonte:
+            let toDst = dstPt - srcPt
+            let along = simd_dot(toDst, targetDir)
+            let closestOnAxis = dstPt - targetDir * along
+            newTransform.translation = closestOnAxis - rotatedLocalPt
+
+        case let (.plane(_, srcNorm, _, srcLocalOrigin, _),
+                  .plane(dstPt, dstNorm, _, _, _)):
+            // Alinhamento planar (faces se tocam):
+            let targetNorm = -dstNorm
+            let rotDelta = Self.alignRotationBetween(srcNorm, targetNorm)
+            let finalRot = simd_normalize(rotDelta * body.transform.rotation)
+            newTransform.rotation = finalRot
+
+            let rotatedLocalOrigin = finalRot.act(srcLocalOrigin * body.transform.scale)
+            newTransform.translation = dstPt - rotatedLocalOrigin
+
+        default:
+            let delta = target.markerPoint - source.markerPoint
+            guard simd_length(delta) > 1e-9 else {
+                mode = .idle
+                return
+            }
+            newTransform.translation += delta
         }
-        var transform = body.transform
-        transform.translation += delta
-        commitTransforms(title: "Align", before: [source: body.transform], after: [source: transform])
-        selection = [source]
-        mode = .selected(source)
+
+        commitTransforms(title: "Align", before: [source.bodyID: body.transform], after: [source.bodyID: newTransform])
+        selection = [source.bodyID]
+        mode = .selected(source.bodyID)
         session.save()
     }
 
@@ -7160,6 +7276,29 @@ final class EditorViewModel {
         areaSelectIncludesSketches.toggle()
     }
 
+    /// Shapr3D parity: cycle through selection filters (Tab key during area select).
+    func cycleAreaSelectFilter() {
+        switch (areaSelectIncludesBodies, areaSelectIncludesSketches) {
+        case (true, true):
+            areaSelectIncludesBodies = true
+            areaSelectIncludesSketches = false
+        case (true, false):
+            areaSelectIncludesBodies = false
+            areaSelectIncludesSketches = true
+        default:
+            areaSelectIncludesBodies = true
+            areaSelectIncludesSketches = true
+        }
+    }
+
+    var areaSelectFilterTitle: String {
+        switch (areaSelectIncludesBodies, areaSelectIncludesSketches) {
+        case (true, false): return "Bodies Only"
+        case (false, true): return "Sketches Only"
+        default: return "All Items"
+        }
+    }
+
     func toggleSelectMode() {
         if selectModeActive {
             exitSelectMode()
@@ -7402,10 +7541,14 @@ final class EditorViewModel {
     }
     private var booleanCancelToken: CancelToken?
 
+    /// Shapr3D parity: keep the tool body when performing a boolean (Subtract/Union/Intersect).
+    var booleanKeepTool: Bool = false
+
     func armBoolean(_ kind: BooleanKind) {
         guard selection.count == 1, let target = selection.first else { return }
         cancelTransientPicks()
         cancelTool()
+        booleanKeepTool = false
         mode = .pickingBooleanTool(kind, target: target)
     }
 
@@ -7824,7 +7967,8 @@ final class EditorViewModel {
                 targetBefore: target,
                 toolIndex: toolIndex,
                 toolBefore: tool,
-                result: composed
+                result: composed,
+                keepTool: self.booleanKeepTool
             )
             // Phase D (Task C2): record a `.boolean` feature node when BOTH the
             // target and tool are feature-produced, so replay can reconstruct
@@ -7890,6 +8034,8 @@ final class EditorViewModel {
         var booleanOverride: BooleanOverride = .auto
         /// Symmetric sides: solid centered on the plane, total depth 2×.
         var symmetric = false
+        /// Draft angle in degrees (Shapr3D: positive tapers inward, negative outward).
+        var draftAngle: Double = 0
         /// False when committing now would fail (arrow renders red).
         var isPendingValid = true
         /// True while the preview should REPLACE the source body in the scene
@@ -8121,21 +8267,48 @@ final class EditorViewModel {
                 )
                 return
             }
-            var solid = KernelOps.extrude(
-                profile: context.profile,
-                holes: context.holes,
-                in: context.plane,
-                distance: distance,
-                symmetric: context.symmetric
-            )
-            for extra in context.extraProfiles {
-                solid = solid.union(KernelOps.extrude(
-                    profile: extra.profile,
-                    holes: extra.holes,
+            var solid: Euclid.Mesh
+            if abs(context.draftAngle) > 1e-4,
+               let drafted = KernelOps.draftExtrude(
+                   profile: context.profile,
+                   holes: context.holes,
+                   in: context.plane,
+                   distance: distance,
+                   taperAngle: context.draftAngle,
+                   symmetric: context.symmetric
+               ) {
+                solid = drafted
+            } else {
+                solid = KernelOps.extrude(
+                    profile: context.profile,
+                    holes: context.holes,
                     in: context.plane,
                     distance: distance,
                     symmetric: context.symmetric
-                ))
+                )
+            }
+            for extra in context.extraProfiles {
+                let extraSolid: Euclid.Mesh
+                if abs(context.draftAngle) > 1e-4,
+                   let drafted = KernelOps.draftExtrude(
+                       profile: extra.profile,
+                       holes: extra.holes,
+                       in: context.plane,
+                       distance: distance,
+                       taperAngle: context.draftAngle,
+                       symmetric: context.symmetric
+                   ) {
+                    extraSolid = drafted
+                } else {
+                    extraSolid = KernelOps.extrude(
+                        profile: extra.profile,
+                        holes: extra.holes,
+                        in: context.plane,
+                        distance: distance,
+                        symmetric: context.symmetric
+                    )
+                }
+                solid = solid.union(extraSolid)
             }
             mesh = solid
         case .revolve(let axis, let angle):
@@ -8385,6 +8558,15 @@ final class EditorViewModel {
         toolContext = context
     }
 
+    func setExtrudeDraftAngle(_ angle: Double) {
+        guard var context = toolContext, case .extrude = context.kind else { return }
+        let clamped = min(max(angle, -80), 80)
+        guard abs(context.draftAngle - clamped) > 1e-4 else { return }
+        context.draftAngle = clamped
+        rebuildToolPreview(&context)
+        toolContext = context
+    }
+
     func setBooleanOverride(_ result: BooleanOverride) {
         guard var context = toolContext, context.booleanOverride != result else { return }
         context.booleanOverride = result
@@ -8497,11 +8679,14 @@ final class EditorViewModel {
         let sampleWorld = context.plane.toWorld(context.profile.centroid) + n * sign * 0.01
         let sample = Vector(sampleWorld.x, sampleWorld.y, sampleWorld.z)
 
+        let mergeTool = abs(context.draftAngle) > 1e-4 ? preview.euclidMesh() : overlapExtrudeTool(context, distance: distance)
+        let title = abs(context.draftAngle) > 1e-4 ? "Draft Extrude" : "Extrude"
+
         commitToolResult(
             preview: preview,
-            mergeTool: overlapExtrudeTool(context, distance: distance),
+            mergeTool: mergeTool,
             sample: sample,
-            title: "Extrude",
+            title: title,
             context: context
         )
     }
@@ -17114,6 +17299,20 @@ final class EditorViewModel {
         let outer = profileRef(profile: context.profile, holes: context.holes, sketchID: sketchID)
         let extras = context.extraProfiles.map {
             profileRef(profile: $0.profile, holes: $0.holes, sketchID: sketchID)
+        }
+        if abs(context.draftAngle) > 1e-4 {
+            return FeatureNode(
+                name: "Draft Extrude",
+                kind: .draftExtrude(
+                    profile: outer,
+                    plane: PlaneRef(source: .sketch(sketchID)),
+                    distance: Expr(value: distance),
+                    taperAngle: Expr(value: context.draftAngle),
+                    symmetric: context.symmetric,
+                    boolean: boolean
+                ),
+                outputBodyIDs: outputBodyIDs
+            )
         }
         return FeatureNode(
             name: "Extrude",

@@ -57,7 +57,10 @@ struct NumericInputBar: View {
     @discardableResult
     private func applyExtrudeDistanceText() -> Bool {
         guard let typed = ExpressionEvaluator.evaluate(extrudeDistanceText) else { return false }
-        viewModel.setExtrudeDistance(AppSettings.shared.unit.mm(fromDisplay: typed))
+        let trimmed = extrudeDistanceText.trimmingCharacters(in: .whitespaces)
+        let hasExplicitSign = trimmed.hasPrefix("-") || trimmed.hasPrefix("+")
+        let signed = hasExplicitSign ? typed : (viewModel.extrudeDirectionSign < 0 ? -abs(typed) : abs(typed))
+        viewModel.setExtrudeDistance(AppSettings.shared.unit.mm(fromDisplay: signed))
         return true
     }
 
@@ -684,6 +687,17 @@ struct NumericInputBar: View {
                         extrudeDistanceFocused = true
                     }
                 )
+                Button {
+                    viewModel.flipExtrudeDirection()
+                    extrudeDistanceText = extrudeDistanceDisplay(viewModel.toolContext?.distance)
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(viewModel.extrudeDirectionSign < 0 ? Color.red : Color.blue)
+                }
+                .buttonStyle(.bordered)
+                .help("Flip Extrude / Cut Direction")
+                .accessibilityIdentifier("ExtrudeBarFlipDirection")
             }
 
             // End condition: Through All / Up To Next resolve to a distance
@@ -761,23 +775,40 @@ struct NumericInputBar: View {
             Spacer()
         } actions: {
             // Sketch profiles can revolve about one of their lines, sweep
-            // along a path, loft to more profiles, or coil into a helix.
+            // along a path, loft to more profiles, or coil into a helix —
+            // grouped into a clean "Switch Tool" menu (Shapr3D style) so the
+            // Extrude bar stays compact and focused.
             if context.sketchID != nil {
-                Button("Revolve") {
-                    viewModel.beginRevolveAxisPick()
+                Menu {
+                    Button {
+                        viewModel.beginRevolveAxisPick()
+                    } label: {
+                        Label("Revolve", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    Button {
+                        viewModel.beginSweepPathPick()
+                    } label: {
+                        Label("Sweep", systemImage: "point.topleft.down.curvedto.point.bottomright.up")
+                    }
+                    Button {
+                        viewModel.beginLoftProfilePick()
+                    } label: {
+                        Label("Loft", systemImage: "square.stack.3d.up")
+                    }
+                    Button {
+                        viewModel.showHelixOptions = true
+                    } label: {
+                        Label("Helix", systemImage: "tornado")
+                    }
+                    Button {
+                        viewModel.beginWrapTargetPick()
+                    } label: {
+                        Label("Wrap", systemImage: "cylinder.split.1x2")
+                    }
+                } label: {
+                    Label("More Tools", systemImage: "ellipsis.circle")
                 }
-                Button("Sweep") {
-                    viewModel.beginSweepPathPick()
-                }
-                Button("Loft") {
-                    viewModel.beginLoftProfilePick()
-                }
-                Button("Helix") {
-                    viewModel.showHelixOptions = true
-                }
-                Button("Wrap") {
-                    viewModel.beginWrapTargetPick()
-                }
+                .accessibilityIdentifier("ExtrudeMoreToolsMenu")
             }
             // Face pulls can become an offset construction plane instead.
             if context.sourceBody != nil {
@@ -804,8 +835,21 @@ struct NumericInputBar: View {
             }
             .buttonStyle(.borderedProminent)
         } footer: {
-            // Boolean badge: manual result override (spec §4.1).
+            // Boolean badge: manual result override + active resolved operation
+            // indicator (Shapr3D BooleanExtrude badge).
+            let resolved = viewModel.resolvedExtrudeBooleanMode(for: context)
+            let isCut = resolved == .subtract
             HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(isCut ? Color.red : Color.blue)
+                        .frame(width: 7, height: 7)
+                    Text(isCut ? "Cut (Subtract)" : (resolved == .union ? "Union" : (resolved == .intersect ? "Intersect" : "New Body")))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(isCut ? Color.red : Color.blue)
+                }
+                .fixedSize()
+                Divider().frame(height: 14)
                 Text("Result")
                     .font(.caption)
                     .foregroundStyle(.barLabel)

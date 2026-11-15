@@ -73,7 +73,7 @@ nonisolated enum FeatureEdgeExtractor {
             let p2 = mesh.positions[i2]
             let cross = simd_cross(p1 - p0, p2 - p0)
             let area = simd_length(cross)
-            guard area > 1e-12 else { continue } // skip degenerate slivers
+            guard area > 1e-20 else { continue } // skip only truly zero-area triangles
             let normal = cross / area
 
             let t0 = topoID[i0]

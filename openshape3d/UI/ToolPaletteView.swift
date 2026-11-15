@@ -388,18 +388,78 @@ struct ToolPaletteView: View {
         if let id = expandedGroupID,
            let group = currentGroups.first(where: { $0.id == id }),
            let frame = groupFrames[id] {
+            flyoutCard(for: group)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .shadow(color: .black.opacity(0.20), radius: 10, y: 3)
+                .fixedSize()
+                .offset(x: paletteOnRight ? -(frame.width + 10) : frame.maxX + 10, y: frame.minY)
+                .transition(.move(edge: .leading).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private func flyoutCard(for group: ToolGroup) -> some View {
+        if group.id == "Modify" {
+            // Shapr3D-style categorized Modify popover: separates 3D profile
+            // sweeps, edge/corner dress-ups, and face direct-modeling tools
+            // into clear labeled rows instead of a 13-button horizontal strip.
+            let sweepIDs: Set<String> = ["Extrude", "Revolve", "Sweep", "Loft", "Helix", "Wrap"]
+            let edgeAndShellIDs: Set<String> = ["Fillet", "Chamfer", "Shell"]
+            let faceIDs: Set<String> = ["Delete Face", "Replace Face", "Imprint Edge", "Patch"]
+
+            let sweepItems = group.items.filter { sweepIDs.contains($0.id) }
+            let edgeItems = group.items.filter { edgeAndShellIDs.contains($0.id) }
+            let faceItems = group.items.filter { faceIDs.contains($0.id) }
+
+            VStack(alignment: .leading, spacing: 8) {
+                flyoutSection(title: "CREATE FROM SKETCH", items: sweepItems)
+                Divider()
+                HStack(alignment: .top, spacing: 14) {
+                    flyoutSection(title: "EDGES & SHELL", items: edgeItems)
+                    Divider().frame(height: 54)
+                    flyoutSection(title: "FACES & HEAL", items: faceItems)
+                }
+            }
+        } else if group.items.count > 4 {
+            // Compact 2-row grid for medium groups (such as Transform).
+            let mid = (group.items.count + 1) / 2
+            let row1 = Array(group.items.prefix(mid))
+            let row2 = Array(group.items.dropFirst(mid))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    ForEach(row1) { item in
+                        toolView(item, inFlyout: true)
+                    }
+                }
+                HStack(spacing: 4) {
+                    ForEach(row2) { item in
+                        toolView(item, inFlyout: true)
+                    }
+                }
+            }
+        } else {
             HStack(spacing: 4) {
                 ForEach(group.items) { item in
                     toolView(item, inFlyout: true)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-            .shadow(color: .black.opacity(0.18), radius: 8, y: 2)
-            .fixedSize()
-            .offset(x: paletteOnRight ? -(frame.width + 10) : frame.maxX + 10, y: frame.minY)
-            .transition(.move(edge: .leading).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private func flyoutSection(title: String, items: [ToolItem]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 4)
+            HStack(spacing: 4) {
+                ForEach(items) { item in
+                    toolView(item, inFlyout: true)
+                }
+            }
         }
     }
 

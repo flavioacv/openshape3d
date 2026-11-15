@@ -1800,7 +1800,7 @@ nonisolated extension FeatureGraph {
         var points = [SIMD3<Double>]()
         for ref in faceRefs {
             guard let resolved = state.naming.resolve(ref, in: body, table: table),
-                  let point = Self.samplePoint(on: resolved) else {
+                  let point = Self.samplePoint(on: resolved, in: body.render) else {
                 state.errors[node.id] = .brokenRef("delete-face target did not resolve")
                 return
             }
@@ -1996,13 +1996,17 @@ nonisolated extension FeatureGraph {
     /// A world point lying ON the resolved face — how OCCT is told which face
     /// to remove. Planar faces use their outline centroid (always interior for
     /// the convex outlines the picker produces); cylinders use a point at
-    /// mid-height on the surface itself, not on the axis.
-    private static func samplePoint(on face: ResolvedFace) -> SIMD3<Double>? {
+    /// mid-height on the surface itself, projected from an actual triangle in
+    /// `cyl.triangles` so 90° quarter-cylinder fillets resolve in any quadrant.
+    private static func samplePoint(on face: ResolvedFace, in mesh: RenderMesh? = nil) -> SIMD3<Double>? {
         if let planar = face.planar, !planar.outline.isEmpty {
             let c = planar.outline.reduce(SIMD2<Double>.zero, +) / Double(planar.outline.count)
             return planar.origin + planar.basisX * c.x + planar.basisY * c.y
         }
         if let cyl = face.cylinder {
+            if let mesh, let target = DeleteFaceKit.target(cylindrical: cyl, in: mesh) {
+                return target.samplePoint
+            }
             let axis = simd_normalize(cyl.axisDir)
             // Any unit vector perpendicular to the axis puts us on the surface.
             let seed = abs(axis.x) < 0.9 ? SIMD3<Double>(1, 0, 0) : SIMD3<Double>(0, 1, 0)

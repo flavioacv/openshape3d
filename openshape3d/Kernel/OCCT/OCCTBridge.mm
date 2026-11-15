@@ -74,6 +74,7 @@
 #include <Standard_Version.hxx>
 
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
@@ -88,6 +89,10 @@
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRepPrimAPI_MakeWedge.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <Poly_Triangle.hxx>
 #include <TopAbs_Orientation.hxx>
@@ -1106,7 +1111,39 @@ static gp_Trsf OS3DBasisTransform(OCCTPlaneBasis *basis) {
                 shape = BRepPrimAPI_MakeCylinder(
                     gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 1.0, 0.0)), a, b).Shape();
                 break;
-            default:  // sphere: centered at (0, r, 0) so it rests on y=0
+            case 2:  // sphere: centered at (0, r, 0) so it rests on y=0
+                if (a <= 0) return nil;
+                shape = BRepPrimAPI_MakeSphere(gp_Pnt(0.0, a, 0.0), a).Shape();
+                break;
+            case 3:  // cone / frustum: base on y=0, axis +Y
+                if (a < 0 || b < 0 || (a <= 0 && b <= 0) || c <= 0) return nil;
+                shape = BRepPrimAPI_MakeCone(
+                    gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 1.0, 0.0)), a, b, c).Shape();
+                break;
+            case 4:  // torus: centered at (0, minorRadius, 0), axis +Y
+                if (a <= 0 || b <= 0 || b >= a) return nil;
+                shape = BRepPrimAPI_MakeTorus(
+                    gp_Ax2(gp_Pnt(0.0, b, 0.0), gp_Dir(0.0, 1.0, 0.0)), a, b).Shape();
+                break;
+            case 5:  // wedge / ramp: base on y=0, dx=a, depth=b, height=c
+                if (a <= 0 || b <= 0 || c <= 0) return nil;
+                shape = BRepPrimAPI_MakeWedge(
+                    gp_Ax2(gp_Pnt(-a / 2.0, 0.0, -b / 2.0), gp_Dir(0.0, 0.0, 1.0)),
+                    a, c, b, 0.0).Shape();
+                break;
+            case 6: { // hollow tube: outerRadius=a, innerRadius=b, height=c
+                if (a <= 0 || b <= 0 || b >= a || c <= 0) return nil;
+                gp_Ax2 ax(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 1.0, 0.0));
+                TopoDS_Shape outer = BRepPrimAPI_MakeCylinder(ax, a, c).Shape();
+                TopoDS_Shape inner = BRepPrimAPI_MakeCylinder(
+                    gp_Ax2(gp_Pnt(0.0, -1.0, 0.0), gp_Dir(0.0, 1.0, 0.0)), b, c + 2.0).Shape();
+                BRepAlgoAPI_Cut cut(outer, inner);
+                if (!cut.IsDone()) return nil;
+                shape = OS3DHealAndValidate(cut.Shape());
+                if (shape.IsNull()) return nil;
+                break;
+            }
+            default:
                 if (a <= 0) return nil;
                 shape = BRepPrimAPI_MakeSphere(gp_Pnt(0.0, a, 0.0), a).Shape();
                 break;
@@ -1125,6 +1162,62 @@ static gp_Trsf OS3DBasisTransform(OCCTPlaneBasis *basis) {
     } catch (...) {
         return nil;
     }
+}
+
++ (nullable OCCTShape *)polygonalPrismWithSides:(NSInteger)sides
+                                         radius:(double)radius
+                                         height:(double)height
+                                      transform:(nullable NSData *)transform {
+    if (sides < 3 || radius <= 0 || height <= 0) return nil;
+    try {
+        OCC_CATCH_SIGNALS
+        BRepBuilderAPI_MakePolygon poly;
+        const double step = (2.0 * M_PI) / (double)sides;
+        for (NSInteger i = 0; i < sides; ++i) {
+            const double angle = step * (double)i;
+            poly.Add(gp_Pnt(radius * std::cos(angle), 0.0, radius * std::sin(angle)));
+        }
+        poly.Close();
+        if (!poly.IsDone()) return nil;
+        TopoDS_Face face = BRepBuilderAPI_MakeFace(poly.Wire(), Standard_True);
+        if (face.IsNull()) return nil;
+        TopoDS_Shape shape = BRepPrimAPI_MakePrism(face, gp_Vec(0.0, height, 0.0)).Shape();
+        shape = OS3DHealAndValidate(shape);
+        if (shape.IsNull()) return nil;
+        if (transform != nil && transform.length >= 12 * sizeof(double)) {
+            const double *m = (const double *)transform.bytes;
+            gp_Trsf t;
+            t.SetValues(m[0], m[1], m[2],  m[3],
+                        m[4], m[5], m[6],  m[7],
+                        m[8], m[9], m[10], m[11]);
+            shape = BRepBuilderAPI_Transform(shape, t, Standard_True).Shape();
+        }
+        OCCTShape *out = [OCCTShape new];
+        out->_shape = shape;
+        return out;
+    } catch (...) {
+        return nil;
+    }
+}
+
++ (nullable OCCTShape *)extrudedTwoSidesShapeWithOuterLoop:(NSData *)outerLoop
+                                                     holes:(NSArray<NSData *> *)holes
+                                                     basis:(OCCTPlaneBasis *)basis
+                                          distancePositive:(double)distancePositive
+                                          distanceNegative:(double)distanceNegative
+                                                   history:(nullable OCCTShapeHistory *)history {
+    if (distancePositive < 0 || distanceNegative < 0) return nil;
+    if (distancePositive + distanceNegative <= 1e-9) return nil;
+    return [self extrudedShapeWithOuterLoop:outerLoop
+                                 outerConic:nil
+                                      holes:holes
+                                 holeConics:nil
+                              outerSegments:nil
+                               holeSegments:nil
+                                       zMin:-distanceNegative
+                                       zMax:distancePositive
+                                      basis:basis
+                                    history:history];
 }
 
 // Ancestry for the sweep-family makers (revolve, pipe): walls are Generated
@@ -2645,7 +2738,198 @@ static void OS3DFillModifierHistory(OCCTShapeHistory *history,
 static OCCTShape *OS3DBlendEdgeSet(const TopoDS_Shape &shape,
                                    const TopTools_IndexedMapOfShape &edgeMap,
                                    const std::set<Standard_Integer> &chosen,
-                                   double amount, bool isFillet,
+                                   double amount, double amount2, bool isFillet,
+                                   bool includeTangentEdges,
+                                   OCCTOpStatus *status,
+                                   OCCTShapeHistory *history);
+
+// Shapr3D Rolling-Ball Corner Re-Blend:
+// When a sharp edge (e.g. a vertical box edge) meets the G1-tangent miter seam
+// between two existing cylindrical fillets (e.g. two filleted top edges),
+// OCCT's ChFi3d spine walker mistakes the miter seam between the two cylinders
+// for a smooth continuation of the vertical edge and curves the seam all the
+// way to the top face (or fails outright for chamfers). When
+// `includeTangentEdges` is false, we heal the adjacent cylindrical fillet
+// faces first, apply the user's blend on the clean sharp edge, and re-apply
+// the cylindrical fillets so the corner forms a true rolling-ball transition.
+static OCCTShape *OS3DTryCornerReblend(
+    const TopoDS_Shape &shape,
+    const TopTools_IndexedMapOfShape &edgeMap,
+    const std::set<Standard_Integer> &qualified,
+    const std::vector<TopoDS_Edge> &extraEdges,
+    double amount, double amount2, bool isFillet
+) {
+    TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+
+    TopTools_ListOfShape cylFacesToRemove;
+    TopTools_MapOfShape seenFaces;
+    struct SavedCyl { gp_Ax1 axis; double radius; };
+    std::vector<SavedCyl> savedCyls;
+
+    for (const TopoDS_Edge &extra : extraEdges) {
+        if (!edgeFaces.Contains(extra)) continue;
+        const TopTools_ListOfShape &faces = edgeFaces.FindFromKey(extra);
+        for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next()) {
+            const TopoDS_Face f = TopoDS::Face(it.Value());
+            if (seenFaces.Contains(f)) continue;
+            BRepAdaptor_Surface surf(f, Standard_False);
+            if (surf.GetType() == GeomAbs_Cylinder) {
+                seenFaces.Add(f);
+                cylFacesToRemove.Append(f);
+                savedCyls.push_back({surf.Cylinder().Axis(), surf.Cylinder().Radius()});
+            }
+        }
+    }
+    if (cylFacesToRemove.IsEmpty()) return nil;
+
+    std::vector<double> qualPts;
+    for (Standard_Integer idx : qualified) {
+        BRepAdaptor_Curve c(TopoDS::Edge(edgeMap(idx)));
+        const gp_Pnt mid = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
+        qualPts.push_back(mid.X());
+        qualPts.push_back(mid.Y());
+        qualPts.push_back(mid.Z());
+    }
+
+    BRepAlgoAPI_Defeaturing defeat;
+    defeat.SetShape(shape);
+    defeat.AddFacesToRemove(cylFacesToRemove);
+    defeat.Build();
+    if (!defeat.IsDone() || defeat.HasErrors()) return nil;
+    const TopoDS_Shape defeatured = OS3DHealAndValidate(defeat.Shape());
+    if (defeatured.IsNull()) return nil;
+
+    TopTools_IndexedMapOfShape defEdgeMap;
+    TopExp::MapShapes(defeatured, TopAbs_EDGE, defEdgeMap);
+    const std::set<Standard_Integer> defChosen =
+        OS3DNearestEdges(defEdgeMap, qualPts.data(), qualified.size(), 1e-2);
+    if (defChosen.empty()) return nil;
+
+    struct RestoredEdge { double pt[3]; double radius; };
+    std::vector<RestoredEdge> restored;
+    for (Standard_Integer i = 1; i <= defEdgeMap.Extent(); ++i) {
+        if (defChosen.count(i)) continue;
+        const TopoDS_Edge e = TopoDS::Edge(defEdgeMap(i));
+        if (BRep_Tool::Degenerated(e)) continue;
+        BRepAdaptor_Curve c(e);
+        const gp_Pnt mid = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
+        const double p[3] = {mid.X(), mid.Y(), mid.Z()};
+        if (!OS3DNearestEdges(edgeMap, p, 1, 1e-3).empty()) continue;
+
+        double bestScore = DBL_MAX;
+        double bestR = savedCyls.front().radius;
+        for (const SavedCyl &sc : savedCyls) {
+            gp_Lin lin(sc.axis);
+            const double distToAxis = lin.Distance(mid);
+            const double score = fabs(distToAxis - sc.radius * M_SQRT2);
+            if (score < bestScore) {
+                bestScore = score;
+                bestR = sc.radius;
+            }
+        }
+        restored.push_back({{p[0], p[1], p[2]}, bestR});
+    }
+    if (restored.empty()) return nil;
+
+    OCCTShape *step1 = OS3DBlendEdgeSet(defeatured, defEdgeMap, defChosen,
+                                        amount, amount2, isFillet,
+                                        /*includeTangentEdges*/ true, nil, nil);
+    if (step1 == nil || step1->_shape.IsNull()) return nil;
+
+    TopTools_IndexedMapOfShape step1Edges;
+    TopExp::MapShapes(step1->_shape, TopAbs_EDGE, step1Edges);
+    BRepFilletAPI_MakeFillet mk2(step1->_shape);
+    std::set<Standard_Integer> reblendSet;
+    for (const RestoredEdge &re : restored) {
+        const std::set<Standard_Integer> matched =
+            OS3DNearestEdges(step1Edges, re.pt, 1, 1e-2);
+        for (Standard_Integer m : matched) {
+            mk2.Add(re.radius, TopoDS::Edge(step1Edges(m)));
+            reblendSet.insert(m);
+        }
+    }
+    if (!reblendSet.empty()) {
+        mk2.Build();
+        if (mk2.IsDone()) {
+            if (OCCTShape *combined = OS3DFinishBlend(
+                    mk2, step1Edges, reblendSet, mk2.NbFaultyContours(), nil)) {
+                return combined;
+            }
+        }
+    }
+
+    // When `step1` is a chamfer on sharp planar edges, each newly created
+    // planar face (absent from `defeatured`) is the exact bevel plane of that
+    // chamfer. Slicing the original filleted `shape` by the half-spaces of
+    // those bevel planes preserves the existing cylindrical fillets and their
+    // miter seam intact while cleanly beveling the selected sharp edge and
+    // corner.
+    if (!isFillet) {
+        TopTools_IndexedMapOfShape defFaces;
+        TopExp::MapShapes(defeatured, TopAbs_FACE, defFaces);
+        TopTools_IndexedMapOfShape step1Faces;
+        TopExp::MapShapes(step1->_shape, TopAbs_FACE, step1Faces);
+
+        TopoDS_Shape cutShape = shape;
+        bool didCut = false;
+        for (Standard_Integer fi = 1; fi <= step1Faces.Extent(); ++fi) {
+            const TopoDS_Face f = TopoDS::Face(step1Faces(fi));
+            if (defFaces.Contains(f)) continue;
+            BRepAdaptor_Surface surf(f, Standard_False);
+            if (surf.GetType() != GeomAbs_Plane) continue;
+            gp_Pln pln = surf.Plane();
+            gp_Dir outN = pln.Axis().Direction();
+            if (f.Orientation() == TopAbs_REVERSED) outN.Reverse();
+
+            // Confirm `f` is a newly created bevel plane (not an existing box
+            // face modified by the chamfer) by checking if any face in
+            // `defeatured` is coplanar with it.
+            bool coplanarWithOld = false;
+            for (Standard_Integer dfi = 1; dfi <= defFaces.Extent(); ++dfi) {
+                BRepAdaptor_Surface dsurf(TopoDS::Face(defFaces(dfi)), Standard_False);
+                if (dsurf.GetType() != GeomAbs_Plane) continue;
+                gp_Pln dpln = dsurf.Plane();
+                if (dpln.Axis().Direction().IsParallel(outN, 1e-4) &&
+                    pln.Distance(dpln.Location()) < 1e-4) {
+                    coplanarWithOld = true;
+                    break;
+                }
+            }
+            if (coplanarWithOld) continue;
+
+            BRepBuilderAPI_MakeFace mf(pln, -1e5, 1e5, -1e5, 1e5);
+            if (!mf.IsDone()) continue;
+            const gp_Pnt refPt = pln.Location().Translated(gp_Vec(outN) * 100.0);
+            BRepPrimAPI_MakeHalfSpace hs(mf.Face(), refPt);
+            BRepAlgoAPI_Cut cut(cutShape, hs.Solid());
+            cut.SetFuzzyValue(1e-5);
+            cut.Build();
+            if (!cut.IsDone() || cut.HasErrors()) return nil;
+            cutShape = cut.Shape();
+            didCut = true;
+        }
+        if (didCut) {
+            int solidCount = 0;
+            const TopoDS_Shape single = OS3DExtractSingleSolid(cutShape, solidCount);
+            if (solidCount == 1 && !single.IsNull()) {
+                const TopoDS_Shape valid = OS3DHealAndValidate(single);
+                if (!valid.IsNull()) {
+                    OCCTShape *out = [OCCTShape new];
+                    out->_shape = valid;
+                    return out;
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+static OCCTShape *OS3DBlendEdgeSet(const TopoDS_Shape &shape,
+                                   const TopTools_IndexedMapOfShape &edgeMap,
+                                   const std::set<Standard_Integer> &chosen,
+                                   double amount, double amount2, bool isFillet,
+                                   bool includeTangentEdges,
                                    OCCTOpStatus *status,
                                    OCCTShapeHistory *history) {
     NSString *reason = nil;
@@ -2655,10 +2939,32 @@ static OCCTShape *OS3DBlendEdgeSet(const TopoDS_Shape &shape,
         OS3DSetStatus(status, OCCTOpCodeNoTargetMatched, reason);
         return nil;
     }
+    TopTools_MapOfShape chosenShapes;
+    for (Standard_Integer i : qualified) {
+        chosenShapes.Add(edgeMap(i));
+    }
     if (isFillet) {
         BRepFilletAPI_MakeFillet mk(shape);
         for (Standard_Integer i : qualified) {
             mk.Add(amount, TopoDS::Edge(edgeMap(i)));
+        }
+        if (!includeTangentEdges) {
+            std::vector<TopoDS_Edge> extraEdges;
+            for (Standard_Integer ic = 1; ic <= mk.NbContours(); ++ic) {
+                for (Standard_Integer j = 1; j <= mk.NbEdges(ic); ++j) {
+                    const TopoDS_Edge &ce = mk.Edge(ic, j);
+                    if (!chosenShapes.Contains(ce)) {
+                        extraEdges.push_back(ce);
+                    }
+                }
+            }
+            if (!extraEdges.empty()) {
+                if (OCCTShape *reblended = OS3DTryCornerReblend(
+                        shape, edgeMap, qualified, extraEdges, amount, amount2, true)) {
+                    OS3DSetStatus(status, OCCTOpCodeOK, nil);
+                    return reblended;
+                }
+            }
         }
         OS3DDeadlineProgress *deadline =
             new OS3DDeadlineProgress(kOS3DOpDeadlineSeconds);
@@ -2676,9 +2982,44 @@ static OCCTShape *OS3DBlendEdgeSet(const TopoDS_Shape &shape,
         return out;
     }
     BRepFilletAPI_MakeChamfer mk(shape);
-    for (Standard_Integer i : qualified) {
-        // Symmetric chamfer: equal setback on both adjacent faces.
-        mk.Add(amount, TopoDS::Edge(edgeMap(i)));
+    const double d2 = amount2 > 0.0 ? amount2 : amount;
+    if (fabs(d2 - amount) > 1e-9) {
+        // Asymmetric 2-distance chamfer (Shapr3D 2-Distances mode):
+        // resolve the reference face deterministically via MapShapesAndAncestors.
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        for (Standard_Integer i : qualified) {
+            const TopoDS_Edge edge = TopoDS::Edge(edgeMap(i));
+            if (edgeFaces.Contains(edge) && !edgeFaces.FindFromKey(edge).IsEmpty()) {
+                const TopoDS_Face refFace = TopoDS::Face(edgeFaces.FindFromKey(edge).First());
+                mk.Add(amount, d2, edge, refFace);
+            } else {
+                mk.Add(amount, edge);
+            }
+        }
+    } else {
+        for (Standard_Integer i : qualified) {
+            // Symmetric chamfer: equal setback on both adjacent faces.
+            mk.Add(amount, TopoDS::Edge(edgeMap(i)));
+        }
+    }
+    if (!includeTangentEdges) {
+        std::vector<TopoDS_Edge> extraEdges;
+        for (Standard_Integer ic = 1; ic <= mk.NbContours(); ++ic) {
+            for (Standard_Integer j = 1; j <= mk.NbEdges(ic); ++j) {
+                const TopoDS_Edge &ce = mk.Edge(ic, j);
+                if (!chosenShapes.Contains(ce)) {
+                    extraEdges.push_back(ce);
+                }
+            }
+        }
+        if (!extraEdges.empty()) {
+            if (OCCTShape *reblended = OS3DTryCornerReblend(
+                    shape, edgeMap, qualified, extraEdges, amount, amount2, false)) {
+                OS3DSetStatus(status, OCCTOpCodeOK, nil);
+                return reblended;
+            }
+        }
     }
     OS3DDeadlineProgress *deadline =
         new OS3DDeadlineProgress(kOS3DOpDeadlineSeconds);
@@ -2699,7 +3040,7 @@ static OCCTShape *OS3DBlendEdgeSet(const TopoDS_Shape &shape,
 // reports). An out-of-range index fails the WHOLE op — identity addressing
 // that silently blended a subset would be worse than failing.
 static OCCTShape *OS3DBlendByIndices(OCCTShape *shape, NSData *edgeIndices,
-                                     double amount, bool isFillet,
+                                     double amount, double amount2, bool isFillet,
                                      OCCTOpStatus *status,
                                      OCCTShapeHistory *history) {
     OS3DSetStatus(status, OCCTOpCodeKernelRefused, @"no input");
@@ -2725,7 +3066,8 @@ static OCCTShape *OS3DBlendByIndices(OCCTShape *shape, NSData *edgeIndices,
             chosen.insert((Standard_Integer)indices[i]);
         }
         return OS3DBlendEdgeSet(shape->_shape, edgeMap, chosen,
-                                amount, isFillet, status, history);
+                                amount, amount2, isFillet,
+                                /*includeTangentEdges*/ false, status, history);
     } catch (Standard_Failure &e) {
         OS3DSetStatus(status, OCCTOpCodeKernelRefused,
                       [NSString stringWithFormat:@"%s", e.GetMessageString()]);
@@ -2741,7 +3083,7 @@ static OCCTShape *OS3DBlendByIndices(OCCTShape *shape, NSData *edgeIndices,
                                radius:(double)radius
                                status:(nullable OCCTOpStatus *)status
                               history:(nullable OCCTShapeHistory *)history {
-    return OS3DBlendByIndices(shape, edgeIndices, radius, true, status, history);
+    return OS3DBlendByIndices(shape, edgeIndices, radius, radius, true, status, history);
 }
 
 + (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
@@ -2749,7 +3091,108 @@ static OCCTShape *OS3DBlendByIndices(OCCTShape *shape, NSData *edgeIndices,
                               distance:(double)distance
                                 status:(nullable OCCTOpStatus *)status
                                history:(nullable OCCTShapeHistory *)history {
-    return OS3DBlendByIndices(shape, edgeIndices, distance, false, status, history);
+    return OS3DBlendByIndices(shape, edgeIndices, distance, distance, false, status, history);
+}
+
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                           edgeIndices:(NSData *)edgeIndices
+                              distance:(double)distance
+                             distance2:(double)distance2
+                                status:(nullable OCCTOpStatus *)status
+                               history:(nullable OCCTShapeHistory *)history {
+    return OS3DBlendByIndices(shape, edgeIndices, distance, distance2, false, status, history);
+}
+
++ (nullable OCCTShape *)variableFilletedShape:(OCCTShape *)shape
+                                atWorldPoints:(NSData *)worldPoints
+                                  startRadius:(double)startRadius
+                                    endRadius:(double)endRadius
+                                    tolerance:(double)tolerance
+                                       status:(nullable OCCTOpStatus *)status
+                                      history:(nullable OCCTShapeHistory *)history {
+    if (shape == nil || shape->_shape.IsNull()) {
+        if (status) status.code = OCCTOpCodeKernelRefused;
+        return nil;
+    }
+    if (startRadius <= 0 || endRadius <= 0 || worldPoints.length < 3 * sizeof(double)) {
+        if (status) status.code = OCCTOpCodeKernelRefused;
+        return nil;
+    }
+    try {
+        OCC_CATCH_SIGNALS
+        TopTools_IndexedMapOfShape edgeMap;
+        TopExp::MapShapes(shape->_shape, TopAbs_EDGE, edgeMap);
+        const NSInteger count = (NSInteger)(worldPoints.length / (3 * sizeof(double)));
+        const std::set<Standard_Integer> indices =
+            OS3DNearestEdges(edgeMap, (const double *)worldPoints.bytes, count, tolerance);
+        if (indices.empty()) {
+            if (status) {
+                status.code = OCCTOpCodeNoTargetMatched;
+                status.detail = @"No edges matched the variable fillet pick.";
+            }
+            return nil;
+        }
+        BRepFilletAPI_MakeFillet mk(shape->_shape);
+        for (Standard_Integer idx : indices) {
+            mk.Add(startRadius, endRadius, TopoDS::Edge(edgeMap(idx)));
+        }
+        mk.Build();
+        if (!mk.IsDone()) {
+            if (status) {
+                status.code = OCCTOpCodeKernelRefused;
+                status.detail = @"Variable-radius fillet failed.";
+            }
+            return nil;
+        }
+        const TopoDS_Shape valid = OS3DHealAndValidate(mk.Shape());
+        if (valid.IsNull()) {
+            if (status) status.code = OCCTOpCodeInvalidResult;
+            return nil;
+        }
+        if (status) status.code = OCCTOpCodeOK;
+        OCCTShape *out = [OCCTShape new];
+        out->_shape = valid;
+        return out;
+    } catch (...) {
+        if (status) status.code = OCCTOpCodeKernelRefused;
+        return nil;
+    }
+}
+
++ (nullable OCCTShape *)thickenedShape:(OCCTShape *)shape
+                             thickness:(double)thickness
+                             tolerance:(double)tolerance
+                                status:(nullable OCCTOpStatus *)status {
+    if (shape == nil || shape->_shape.IsNull() || std::abs(thickness) <= 1e-6) {
+        if (status) status.code = OCCTOpCodeKernelRefused;
+        return nil;
+    }
+    try {
+        OCC_CATCH_SIGNALS
+        const double tol = tolerance > 0 ? tolerance : 1e-3;
+        TopTools_ListOfShape closingFaces;
+        BRepOffsetAPI_MakeThickSolid mk;
+        mk.MakeThickSolidByJoin(shape->_shape, closingFaces, thickness, tol);
+        if (!mk.IsDone()) {
+            if (status) {
+                status.code = OCCTOpCodeKernelRefused;
+                status.detail = @"Could not thicken surface/body at this thickness.";
+            }
+            return nil;
+        }
+        const TopoDS_Shape valid = OS3DHealAndValidate(mk.Shape());
+        if (valid.IsNull()) {
+            if (status) status.code = OCCTOpCodeInvalidResult;
+            return nil;
+        }
+        if (status) status.code = OCCTOpCodeOK;
+        OCCTShape *out = [OCCTShape new];
+        out->_shape = valid;
+        return out;
+    } catch (...) {
+        if (status) status.code = OCCTOpCodeKernelRefused;
+        return nil;
+    }
 }
 
 /// Whether the face's UV domain is an untrimmed iso-rectangle — one wire,
@@ -3013,6 +3456,157 @@ static double OS3DSpanExactArea(const TopoDS_Face &face) {
     }
 }
 
++ (nullable NSData *)edgeDiagnosticsOfShape:(OCCTShape *)shape {
+    if (shape == nil || shape->_shape.IsNull()) return nil;
+    try {
+        TopTools_IndexedMapOfShape faceMap, edgeMap;
+        TopExp::MapShapes(shape->_shape, TopAbs_FACE, faceMap);
+        TopExp::MapShapes(shape->_shape, TopAbs_EDGE, edgeMap);
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(shape->_shape, TopAbs_EDGE, TopAbs_FACE,
+                                      edgeFaces);
+        std::vector<int32_t> rows;
+        rows.reserve((size_t)edgeMap.Extent() * 4);
+        for (Standard_Integer e = 1; e <= edgeMap.Extent(); ++e) {
+            const TopoDS_Edge &edge = TopoDS::Edge(edgeMap(e));
+            if (!edgeFaces.Contains(edge)) {
+                rows.push_back((int32_t)e);
+                rows.push_back(0);
+                rows.push_back(0);
+                rows.push_back(0);
+                continue;
+            }
+            std::vector<int32_t> distinctFaces;
+            std::vector<TopoDS_Face> faceRefs;
+            for (TopTools_ListOfShape::Iterator it(edgeFaces.FindFromKey(edge));
+                 it.More(); it.Next()) {
+                const int32_t f = (int32_t)faceMap.FindIndex(it.Value());
+                if (f <= 0) continue;
+                if (std::find(distinctFaces.begin(), distinctFaces.end(), f) == distinctFaces.end()) {
+                    distinctFaces.push_back(f);
+                    faceRefs.push_back(TopoDS::Face(it.Value()));
+                }
+            }
+            if (distinctFaces.size() != 2) {
+                rows.push_back((int32_t)e);
+                rows.push_back(0);
+                rows.push_back(distinctFaces.empty() ? 0 : distinctFaces[0]);
+                rows.push_back(0);
+                continue;
+            }
+            int32_t fA = distinctFaces[0];
+            int32_t fB = distinctFaces[1];
+            TopoDS_Face faceA = faceRefs[0];
+            TopoDS_Face faceB = faceRefs[1];
+            if (fA > fB) {
+                std::swap(fA, fB);
+                std::swap(faceA, faceB);
+            }
+            int32_t kindCode = 2; // default convex sharp corner
+            if (BRep_Tool::Continuity(edge, faceA, faceB) >= GeomAbs_G1) {
+                kindCode = 1; // tangent / smooth G1+
+            } else {
+                Standard_Real f2dA = 0, l2dA = 0, f2dB = 0, l2dB = 0;
+                Handle(Geom2d_Curve) c2dA = BRep_Tool::CurveOnSurface(edge, faceA, f2dA, l2dA);
+                Handle(Geom2d_Curve) c2dB = BRep_Tool::CurveOnSurface(edge, faceB, f2dB, l2dB);
+                if (!c2dA.IsNull() && !c2dB.IsNull()) {
+                    const gp_Pnt2d uvA = c2dA->Value(0.5 * (f2dA + l2dA));
+                    const gp_Pnt2d uvB = c2dB->Value(0.5 * (f2dB + l2dB));
+                    gp_Pnt pA, pB;
+                    gp_Vec nA, nB;
+                    BRepGProp_Face propA(faceA);
+                    BRepGProp_Face propB(faceB);
+                    propA.Normal(uvA.X(), uvA.Y(), pA, nA);
+                    propB.Normal(uvB.X(), uvB.Y(), pB, nB);
+                    if (nA.SquareMagnitude() > 1e-18 && nB.SquareMagnitude() > 1e-18) {
+                        nA.Normalize();
+                        nB.Normalize();
+                        const double cosAngle = std::max(-1.0, std::min(1.0, nA.Dot(nB)));
+                        if (cosAngle > 0.999847695) { // < ~1 deg => tangent
+                            kindCode = 1;
+                        } else {
+                            BRepAdaptor_Curve ac(edge);
+                            const Standard_Real tMid = 0.5 * (ac.FirstParameter() + ac.LastParameter());
+                            gp_Pnt edgePt;
+                            gp_Vec edgeTan;
+                            ac.D1(tMid, edgePt, edgeTan);
+                            if (edgeTan.SquareMagnitude() > 1e-18) {
+                                edgeTan.Normalize();
+                                // Match edge orientation inside faceA's outer boundary.
+                                for (TopExp_Explorer ex(faceA, TopAbs_EDGE); ex.More(); ex.Next()) {
+                                    if (ex.Current().IsSame(edge)) {
+                                        if (ex.Current().Orientation() == TopAbs_REVERSED) {
+                                            edgeTan.Reverse();
+                                        }
+                                        break;
+                                    }
+                                }
+                                const gp_Vec cross = nA.Crossed(nB);
+                                kindCode = (cross.Dot(edgeTan) >= 0.0) ? 2 : 3;
+                            }
+                        }
+                    }
+                }
+            }
+            rows.push_back((int32_t)e);
+            rows.push_back(kindCode);
+            rows.push_back(fA);
+            rows.push_back(fB);
+        }
+        return [NSData dataWithBytes:rows.data()
+                              length:rows.size() * sizeof(int32_t)];
+    } catch (...) {
+        return nil;
+    }
+}
+
++ (double)minimumDistanceBetweenShape:(OCCTShape *)shapeA
+                             andShape:(OCCTShape *)shapeB {
+    if (shapeA == nil || shapeB == nil ||
+        shapeA->_shape.IsNull() || shapeB->_shape.IsNull()) {
+        return -1.0;
+    }
+    try {
+        OCC_CATCH_SIGNALS
+        BRepExtrema_DistShapeShape dist(shapeA->_shape, shapeB->_shape);
+        if (!dist.IsDone()) return -1.0;
+        return dist.Value();
+    } catch (...) {
+        return -1.0;
+    }
+}
+
++ (nullable OCCTShape *)sewShapes:(NSArray<OCCTShape *> *)shapes
+                        tolerance:(double)tolerance {
+    if (shapes.count == 0) return nil;
+    try {
+        OCC_CATCH_SIGNALS
+        const double tol = tolerance > 0.0 ? tolerance : 1e-3;
+        BRepBuilderAPI_Sewing sewing(tol);
+        for (OCCTShape *s in shapes) {
+            if (s != nil && !s->_shape.IsNull()) {
+                sewing.Add(s->_shape);
+            }
+        }
+        sewing.Perform();
+        TopoDS_Shape sewn = sewing.SewedShape();
+        if (sewn.IsNull()) return nil;
+        if (sewn.ShapeType() == TopAbs_SHELL) {
+            BRepBuilderAPI_MakeSolid mkSolid(TopoDS::Shell(sewn));
+            if (mkSolid.IsDone()) {
+                sewn = mkSolid.Solid();
+            }
+        }
+        const TopoDS_Shape valid = OS3DHealAndValidate(sewn);
+        if (valid.IsNull()) return nil;
+        OCCTShape *out = [OCCTShape new];
+        out->_shape = valid;
+        return out;
+    } catch (...) {
+        return nil;
+    }
+}
+
 + (NSInteger)nearestEdgeIndexOfShape:(OCCTShape *)shape
                             toPointX:(double)x y:(double)y z:(double)z
                            tolerance:(double)tolerance {
@@ -3069,6 +3663,17 @@ static double OS3DSpanExactArea(const TopoDS_Face &face) {
                                radius:(double)radius
                             tolerance:(double)tolerance
                                status:(nullable OCCTOpStatus *)status {
+    return [self filletedShape:shape atWorldPoints:worldPoints
+                        radius:radius tolerance:tolerance
+           includeTangentEdges:NO status:status];
+}
+
++ (nullable OCCTShape *)filletedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                               radius:(double)radius
+                            tolerance:(double)tolerance
+                  includeTangentEdges:(BOOL)includeTangentEdges
+                               status:(nullable OCCTOpStatus *)status {
     OS3DSetStatus(status, OCCTOpCodeKernelRefused, @"no input");
     if (shape == nil || radius <= 0.0) return nil;
     const NSUInteger count = worldPoints.length / (3 * sizeof(double));
@@ -3097,7 +3702,8 @@ static double OS3DSpanExactArea(const TopoDS_Face &face) {
             return nil;
         }
         return OS3DBlendEdgeSet(shape->_shape, edgeMap, chosen,
-                                radius, /*isFillet*/ true, status, nil);
+                                radius, radius, /*isFillet*/ true,
+                                (bool)includeTangentEdges, status, nil);
     } catch (Standard_Failure &e) {
         OS3DSetStatus(status, OCCTOpCodeKernelRefused,
                       [NSString stringWithFormat:@"%s", e.GetMessageString()]);
@@ -3236,6 +3842,30 @@ static bool OS3DFilletBuilds(const TopoDS_Shape &shape,
                              distance:(double)distance
                             tolerance:(double)tolerance
                                 status:(nullable OCCTOpStatus *)status {
+    return [self chamferedShape:shape atWorldPoints:worldPoints
+                       distance:distance distance2:distance
+                      tolerance:tolerance status:status];
+}
+
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                             distance:(double)distance
+                            distance2:(double)distance2
+                            tolerance:(double)tolerance
+                                status:(nullable OCCTOpStatus *)status {
+    return [self chamferedShape:shape atWorldPoints:worldPoints
+                       distance:distance distance2:distance2
+                      tolerance:tolerance includeTangentEdges:NO
+                         status:status];
+}
+
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                             distance:(double)distance
+                            distance2:(double)distance2
+                            tolerance:(double)tolerance
+                  includeTangentEdges:(BOOL)includeTangentEdges
+                                status:(nullable OCCTOpStatus *)status {
     OS3DSetStatus(status, OCCTOpCodeKernelRefused, @"no input");
     if (shape == nil || distance <= 0.0) return nil;
     const NSUInteger count = worldPoints.length / (3 * sizeof(double));
@@ -3265,7 +3895,8 @@ static bool OS3DFilletBuilds(const TopoDS_Shape &shape,
             return nil;
         }
         return OS3DBlendEdgeSet(shape->_shape, edgeMap, chosen,
-                                distance, /*isFillet*/ false, status, nil);
+                                distance, distance2, /*isFillet*/ false,
+                                (bool)includeTangentEdges, status, nil);
     } catch (Standard_Failure &e) {
         OS3DSetStatus(status, OCCTOpCodeKernelRefused,
                       [NSString stringWithFormat:@"%s", e.GetMessageString()]);

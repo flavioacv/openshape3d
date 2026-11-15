@@ -412,6 +412,15 @@ nonisolated enum OCCTKernel {
 
     /// Build the analytic OCCT solid for a primitive, matching Euclid's placement
     /// conventions so B-rep and CSG mesh coincide. `placement` is baked in.
+    private static func packTransform(_ placement: Transform3D) -> Data? {
+        guard placement != .identity else { return nil }
+        let m = placement.matrix
+        var flat = [Double]()
+        flat.reserveCapacity(12)
+        for r in 0..<3 { for col in 0..<4 { flat.append(m[col][r]) } }
+        return flat.withUnsafeBytes { Data($0) }
+    }
+
     static func primitiveShape(_ spec: PrimitiveSpec, placement: Transform3D) -> BRepHandle? {
         let kind: Int, a: Double, b: Double, c: Double
         switch spec {
@@ -419,14 +428,7 @@ nonisolated enum OCCTKernel {
         case let .cylinder(radius, height):  kind = 1; a = radius; b = height; c = 0
         case let .sphere(radius):            kind = 2; a = radius; b = 0; c = 0
         }
-        var data: Data?
-        if placement != .identity {
-            let m = placement.matrix  // simd is column-major: m[col][row]
-            var flat = [Double]()
-            for r in 0..<3 { for col in 0..<4 { flat.append(m[col][r]) } }
-            data = flat.withUnsafeBytes { Data($0) }
-        }
-        return OCCTBridge.primitiveShape(ofKind: kind, a: a, b: b, c: c, transform: data)
+        return OCCTBridge.primitiveShape(ofKind: kind, a: a, b: b, c: c, transform: packTransform(placement))
             .map(BRepHandle.init)
     }
 
@@ -683,13 +685,22 @@ nonisolated enum OCCTKernel {
     static func filletResult(_ handle: BRepHandle, at points: [SIMD3<Double>],
                              radius: Double, tolerance: Double)
         -> Result<BRepHandle, OCCTOpError> {
+        filletResult(handle, at: points, radius: radius,
+                     tolerance: tolerance, includeTangentEdges: false)
+    }
+
+    static func filletResult(_ handle: BRepHandle, at points: [SIMD3<Double>],
+                             radius: Double, tolerance: Double,
+                             includeTangentEdges: Bool)
+        -> Result<BRepHandle, OCCTOpError> {
         guard !points.isEmpty, radius > 0 else {
             return .failure(.kernelRefused("nothing to fillet"))
         }
         let status = OCCTOpStatus()
         guard let shape = OCCTBridge.filletedShape(
             handle.shape, atWorldPoints: pack(points),
-            radius: radius, tolerance: tolerance, status: status) else {
+            radius: radius, tolerance: tolerance,
+            includeTangentEdges: includeTangentEdges, status: status) else {
             let error = OCCTOpError(status)
             KernelCapture.recordFailure(
                 op: "fillet", inputs: [("shape", handle)],
@@ -702,27 +713,127 @@ nonisolated enum OCCTKernel {
     }
 
     static func fillet(_ handle: BRepHandle, at points: [SIMD3<Double>],
-                       radius: Double, tolerance: Double) -> BRepHandle? {
+                       radius: Double, tolerance: Double,
+                       includeTangentEdges: Bool = false) -> BRepHandle? {
         try? filletResult(handle, at: points, radius: radius,
-                          tolerance: tolerance).get()
+                          tolerance: tolerance,
+                          includeTangentEdges: includeTangentEdges).get()
     }
 
-    /// Bevel the analytic edges nearest `points` by `distance` (spec §4.3
-    /// chamfer). Same contract as `filletResult`.
+    /// Variable-radius fillet from `startRadius` to `endRadius` along edges near `points`.
+    static func variableFilletResult(_ handle: BRepHandle, at points: [SIMD3<Double>],
+                                     startRadius: Double, endRadius: Double,
+                                     tolerance: Double) -> Result<BRepHandle, OCCTOpError> {
+        guard !points.isEmpty, startRadius > 0, endRadius > 0 else {
+            return .failure(.kernelRefused("invalid variable fillet parameters"))
+        }
+        let status = OCCTOpStatus()
+        guard let shape = OCCTBridge.variableFilletedShape(
+            handle.shape, atWorldPoints: pack(points),
+            startRadius: startRadius, endRadius: endRadius,
+            tolerance: tolerance, status: status, history: nil) else {
+            return .failure(OCCTOpError(status))
+        }
+        return .success(BRepHandle(shape))
+    }
+
+    /// Thicken an open shell/face or solid into a watertight solid for 3D printing.
+    static func thickenResult(_ handle: BRepHandle, thickness: Double,
+                              tolerance: Double = 1e-3) -> Result<BRepHandle, OCCTOpError> {
+        let status = OCCTOpStatus()
+        guard let shape = OCCTBridge.thickenedShape(
+            handle.shape, thickness: thickness,
+            tolerance: tolerance, status: status) else {
+            return .failure(OCCTOpError(status))
+        }
+        return .success(BRepHandle(shape))
+    }
+
+    /// Extended B-rep primitives (cone, torus, wedge, hollow tube, polygonal prism).
+    static func cone(bottomRadius: Double, topRadius: Double, height: Double,
+                     transform: Transform3D = .identity) -> BRepHandle? {
+        OCCTBridge.primitiveShape(ofKind: 3, a: bottomRadius, b: topRadius, c: height,
+                                  transform: packTransform(transform)).map(BRepHandle.init)
+    }
+
+    static func torus(majorRadius: Double, minorRadius: Double,
+                      transform: Transform3D = .identity) -> BRepHandle? {
+        OCCTBridge.primitiveShape(ofKind: 4, a: majorRadius, b: minorRadius, c: 0,
+                                  transform: packTransform(transform)).map(BRepHandle.init)
+    }
+
+    static func wedge(dx: Double, depth: Double, height: Double,
+                      transform: Transform3D = .identity) -> BRepHandle? {
+        OCCTBridge.primitiveShape(ofKind: 5, a: dx, b: depth, c: height,
+                                  transform: packTransform(transform)).map(BRepHandle.init)
+    }
+
+    static func tube(outerRadius: Double, innerRadius: Double, height: Double,
+                     transform: Transform3D = .identity) -> BRepHandle? {
+        OCCTBridge.primitiveShape(ofKind: 6, a: outerRadius, b: innerRadius, c: height,
+                                  transform: packTransform(transform)).map(BRepHandle.init)
+    }
+
+    static func polygonalPrism(sides: Int, radius: Double, height: Double,
+                               transform: Transform3D = .identity) -> BRepHandle? {
+        OCCTBridge.polygonalPrism(withSides: sides, radius: radius, height: height,
+                                  transform: packTransform(transform)).map(BRepHandle.init)
+    }
+
+    /// Asymmetric two-sided extrusion from a sketch loop.
+    static func extrudeTwoSides(
+        outerLoop: [SIMD2<Double>],
+        holes: [[SIMD2<Double>]] = [],
+        distancePositive: Double,
+        distanceNegative: Double,
+        origin: SIMD3<Double>, xAxis: SIMD3<Double>,
+        yAxis: SIMD3<Double>, normal: SIMD3<Double>
+    ) -> BRepHandle? {
+        let basis = OCCTPlaneBasis(
+            originX: origin.x, originY: origin.y, originZ: origin.z,
+            xAxisX: xAxis.x, xAxisY: xAxis.y, xAxisZ: xAxis.z,
+            yAxisX: yAxis.x, yAxisY: yAxis.y, yAxisZ: yAxis.z,
+            normalX: normal.x, normalY: normal.y, normalZ: normal.z
+        )
+        return OCCTBridge.extrudedTwoSidesShape(
+            withOuterLoop: packLoop(outerLoop),
+            holes: holes.map { packLoop($0) },
+            basis: basis,
+            distancePositive: distancePositive,
+            distanceNegative: distanceNegative,
+            history: nil
+        ).map(BRepHandle.init)
+    }
+
+    /// Bevel the analytic edges nearest `points` by `distance` (and optional
+    /// asymmetric `distance2`, spec §4.3 chamfer). Same contract as `filletResult`.
     static func chamferResult(_ handle: BRepHandle, at points: [SIMD3<Double>],
-                              distance: Double, tolerance: Double)
+                              distance: Double, distance2: Double? = nil,
+                              tolerance: Double)
         -> Result<BRepHandle, OCCTOpError> {
-        guard !points.isEmpty, distance > 0 else {
+        chamferResult(handle, at: points, distance: distance,
+                      distance2: distance2, tolerance: tolerance,
+                      includeTangentEdges: false)
+    }
+
+    static func chamferResult(_ handle: BRepHandle, at points: [SIMD3<Double>],
+                              distance: Double, distance2: Double? = nil,
+                              tolerance: Double,
+                              includeTangentEdges: Bool)
+        -> Result<BRepHandle, OCCTOpError> {
+        let d2 = distance2 ?? distance
+        guard !points.isEmpty, distance > 0, d2 > 0 else {
             return .failure(.kernelRefused("nothing to chamfer"))
         }
         let status = OCCTOpStatus()
         guard let shape = OCCTBridge.chamferedShape(
             handle.shape, atWorldPoints: pack(points),
-            distance: distance, tolerance: tolerance, status: status) else {
+            distance: distance, distance2: d2, tolerance: tolerance,
+            includeTangentEdges: includeTangentEdges, status: status) else {
             let error = OCCTOpError(status)
             KernelCapture.recordFailure(
                 op: "chamfer", inputs: [("shape", handle)],
-                params: ["distance": distance, "tolerance": tolerance,
+                params: ["distance": distance, "distance2": d2, "tolerance": tolerance,
                          "points": points.map { [$0.x, $0.y, $0.z] }],
                 error: error)
             return .failure(error)
@@ -731,9 +842,10 @@ nonisolated enum OCCTKernel {
     }
 
     static func chamfer(_ handle: BRepHandle, at points: [SIMD3<Double>],
-                        distance: Double, tolerance: Double) -> BRepHandle? {
+                        distance: Double, distance2: Double? = nil,
+                        tolerance: Double) -> BRepHandle? {
         try? chamferResult(handle, at: points, distance: distance,
-                           tolerance: tolerance).get()
+                           distance2: distance2, tolerance: tolerance).get()
     }
 
     // MARK: Identity-addressed blends (TOPO_NAMING_HISTORY_DESIGN step 4b)
@@ -753,6 +865,70 @@ nonisolated enum OCCTKernel {
                         Int(values[base + 2])))
         }
         return out
+    }
+
+    /// Topological/geometric classification of a B-rep edge (Shapr3D parity:
+    /// `_PK_EDGE_ask_convexity` / `_PK_EDGE_is_smooth`).
+    enum EdgeKind: Int32, Sendable, Equatable {
+        case borderOrSeam = 0
+        case tangent = 1
+        case convex = 2
+        case concave = 3
+
+        var isBlendable: Bool {
+            self == .convex || self == .concave
+        }
+    }
+
+    struct EdgeDiagnostic: Sendable, Equatable {
+        let edgeIndex: Int
+        let kind: EdgeKind
+        let faceA: Int
+        let faceB: Int
+    }
+
+    /// Exact B-rep edge classification (`borderOrSeam`, `tangent`, `convex`,
+    /// `concave`) for every edge in `handle` (1-based indexed-map order).
+    static func edgeDiagnostics(_ handle: BRepHandle) -> [EdgeDiagnostic] {
+        guard let data = OCCTBridge.edgeDiagnostics(of: handle.shape) else { return [] }
+        let values = data.int32Array()
+        var out: [EdgeDiagnostic] = []
+        out.reserveCapacity(values.count / 4)
+        for base in stride(from: 0, to: (values.count / 4) * 4, by: 4) {
+            let kind = EdgeKind(rawValue: values[base + 1]) ?? .borderOrSeam
+            out.append(EdgeDiagnostic(
+                edgeIndex: Int(values[base]),
+                kind: kind,
+                faceA: Int(values[base + 2]),
+                faceB: Int(values[base + 3])
+            ))
+        }
+        return out
+    }
+
+    /// Query the B-rep classification of the edge nearest `point` (in body-local
+    /// coordinates), or nil when no edge is within `tolerance`.
+    static func edgeKind(_ handle: BRepHandle, atLocalPoint point: SIMD3<Double>,
+                         tolerance: Double = 0.5) -> EdgeKind? {
+        guard let edgeIndex = nearestEdgeIndex(handle, to: point, tolerance: tolerance) else {
+            return nil
+        }
+        return edgeDiagnostics(handle).first(where: { $0.edgeIndex == edgeIndex })?.kind
+    }
+
+    /// Exact minimum B-rep distance (mm) between two solids, or nil on error.
+    static func minimumDistance(between a: BRepHandle, and b: BRepHandle) -> Double? {
+        let d = OCCTBridge.minimumDistanceBetweenShape(a.shape, andShape: b.shape)
+        return d >= 0 ? d : nil
+    }
+
+    /// Sew open shells/faces into a closed solid for watertight 3D printing.
+    static func sew(_ handles: [BRepHandle], tolerance: Double = 1e-3) -> BRepHandle? {
+        guard !handles.isEmpty else { return nil }
+        guard let sewn = OCCTBridge.sewShapes(handles.map(\.shape), tolerance: tolerance) else {
+            return nil
+        }
+        return BRepHandle(sewn)
     }
 
     /// The kernel edge nearest a world point — the mint-time bridge from a
@@ -857,18 +1033,19 @@ nonisolated enum OCCTKernel {
     }
 
     static func chamferResult(_ handle: BRepHandle, edgeIndices: [Int],
-                              distance: Double) -> Result<BRepHandle, OCCTOpError> {
-        guard !edgeIndices.isEmpty, distance > 0 else {
+                              distance: Double, distance2: Double? = nil) -> Result<BRepHandle, OCCTOpError> {
+        let d2 = distance2 ?? distance
+        guard !edgeIndices.isEmpty, distance > 0, d2 > 0 else {
             return .failure(.kernelRefused("nothing to chamfer"))
         }
         let status = OCCTOpStatus()
         guard let shape = OCCTBridge.chamferedShape(
             handle.shape, edgeIndices: packIndices(edgeIndices),
-            distance: distance, status: status, history: nil) else {
+            distance: distance, distance2: d2, status: status, history: nil) else {
             let error = OCCTOpError(status)
             KernelCapture.recordFailure(
                 op: "chamfer", inputs: [("shape", handle)],
-                params: ["distance": distance, "edgeIndices": edgeIndices],
+                params: ["distance": distance, "distance2": d2, "edgeIndices": edgeIndices],
                 error: error)
             return .failure(error)
         }
@@ -981,6 +1158,80 @@ nonisolated enum OCCTKernel {
         }
         return booleanResult(handle, BRepHandle(tool), op: distance > 0 ? 0 : 1)
             .map(\.handle)
+    }
+
+    /// Shapr3D parity (`PK_FACE_offset_2` behavior): when pushing/pulling a planar
+    /// face adjacent to cylindrical fillets, temporarily heal those adjacent fillets,
+    /// offset the clean planar face (avoiding artificial vertical steps), and re-apply
+    /// the fillets at their original analytic radii. Falls back cleanly to standard
+    /// `pushPullResult` if healing/re-blending fails.
+    static func pushPullPreservingFilletsResult(_ handle: BRepHandle, face: PlanarFace,
+                                                render: RenderMesh, distance: Double)
+        -> Result<BRepHandle, OCCTOpError> {
+        guard abs(distance) > 1e-9,
+              let point = interiorPoint(of: face.triangles, in: render) else {
+            return .failure(.kernelRefused("nothing to push or pull"))
+        }
+        let faces = faceInfo(handle)
+        let adjacency = edgeFaceAdjacency(handle)
+        let n = simd_normalize(SIMD3<Double>(
+            Double(face.normal.x), Double(face.normal.y), Double(face.normal.z)))
+
+        // Identify the target planar face index and any cylindrical fillet faces sharing an edge.
+        if let targetFace = faces.first(where: { f in
+            guard case .planar? = f.signature?.kind else { return false }
+            let sameNormal = simd_dot(f.normal, n) > 0.99
+            let nearPlane = abs(simd_dot(point - f.centroid, f.normal)) < 0.05
+            return sameNormal && nearPlane
+        }) {
+            var adjCylinders: [(face: KernelFaceInfo, radius: Double, edgeMidpoint: SIMD3<Double>)] = []
+            let midpoints = edgeMidpoints(handle)
+            for adj in adjacency {
+                let otherIdx: Int?
+                if adj.faceA == targetFace.index { otherIdx = adj.faceB }
+                else if adj.faceB == targetFace.index { otherIdx = adj.faceA }
+                else { otherIdx = nil }
+                if let oIdx = otherIdx,
+                   let cyl = faces.first(where: { $0.index == oIdx }),
+                   case let .cylindrical(radius)? = cyl.signature?.kind,
+                   radius > 0,
+                   let mid = midpoints[adj.edge] {
+                    // Only treat partial cylindrical blends (fillets), not whole-body cylinders.
+                    if !adjCylinders.contains(where: { $0.face.index == cyl.index }) {
+                        adjCylinders.append((cyl, radius, mid))
+                    }
+                }
+            }
+
+            if !adjCylinders.isEmpty {
+                let tol = matchTolerance(for: handle)
+                let filletPoints = adjCylinders.map { $0.face.centroid }
+                if case .success(let healed) = removingFacesResult(handle, at: filletPoints, tolerance: max(tol, 0.5)),
+                   let healedTool = OCCTBridge.pushPullTool(
+                    for: healed.shape, pointX: point.x, pointY: point.y, pointZ: point.z,
+                    normalX: n.x, normalY: n.y, normalZ: n.z,
+                    distance: distance, tolerance: tol, status: nil),
+                   case .success(let pushed) = booleanResult(healed, BRepHandle(healedTool), op: distance > 0 ? 0 : 1).map(\.handle) {
+                    var current = pushed
+                    var allReblended = true
+                    for item in adjCylinders {
+                        let shiftedPt = item.edgeMidpoint + n * distance
+                        if case .success(let reblended) = filletResult(
+                            current, at: [shiftedPt], radius: item.radius,
+                            tolerance: max(tol, 0.5), includeTangentEdges: false) {
+                            current = reblended
+                        } else {
+                            allReblended = false
+                            break
+                        }
+                    }
+                    if allReblended {
+                        return .success(current)
+                    }
+                }
+            }
+        }
+        return pushPullResult(handle, face: face, render: render, distance: distance)
     }
 
     /// Imprint Edge (spec §4.17): split the faces of `handle` along
@@ -1112,13 +1363,15 @@ nonisolated enum OCCTKernel {
         OCCTBridge.shape(fromSerialized: data).map(BRepHandle.init)
     }
 
-    /// Smooth world-space render mesh for a B-rep solid.
-    static func renderMesh(from handle: BRepHandle)
+    /// Smooth world-space render mesh for a B-rep solid at custom deflections.
+    static func renderMesh(from handle: BRepHandle,
+                           angularDeflection: Double = renderAngularDeflection,
+                           linearDeflection: Double = renderLinearDeflection)
         -> (positions: [SIMD3<Float>], normals: [SIMD3<Float>], indices: [UInt32]) {
         let mesh = OCCTBridge.renderMesh(
             from: handle.shape,
-            angularDeflection: renderAngularDeflection,
-            linearDeflection: renderLinearDeflection)
+            angularDeflection: angularDeflection,
+            linearDeflection: linearDeflection)
         let p = mesh.positions.floatArray()
         let nn = mesh.normals.floatArray()
         let indices = mesh.indices.uint32Array()
@@ -1218,11 +1471,11 @@ nonisolated extension Body {
     /// coarse 48-gon. Returns false (leaving the body untouched) if the solid
     /// fails to tessellate, so callers fall back to the Euclid path.
     ///
-    /// `keepingFaceRegions` (Imprint Edge, spec §4.17) also records which
-    /// kernel face each triangle belongs to, so picking honours faces the
-    /// solid's geometry alone cannot show — coplanar pieces of a split face.
+    /// `keepingFaceRegions` records which kernel face each triangle belongs to,
+    /// so tangent seams (e.g. fillet/chamfer boundaries) render cleanly and
+    /// picking honours exact B-Rep faces. Defaults to `true` (Shapr3D parity).
     @discardableResult
-    mutating func adoptBRep(_ handle: BRepHandle, keepingFaceRegions: Bool = false) -> Bool {
+    mutating func adoptBRep(_ handle: BRepHandle, keepingFaceRegions: Bool = true) -> Bool {
         let m = OCCTKernel.renderMesh(from: handle)
         guard !m.positions.isEmpty, !m.indices.isEmpty else { return false }
         var mesh = RenderMesh(positions: m.positions, normals: m.normals, indices: m.indices)

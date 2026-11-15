@@ -160,20 +160,94 @@ struct ExtrudeGizmoOverlay: View {
                     .accessibilityIdentifier("ExtrudeExtentMenu")
                 }
 
-                Button {
-                    viewModel.beginExtrudeArrowEdit()
-                } label: {
-                    Text(label.text)
-                        .font(.caption.weight(.semibold))
-                        .monospacedDigit()
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
-                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.blue, lineWidth: 1.5))
-                        .foregroundStyle(Color.blue)
+                HStack(spacing: 4) {
+                    Button {
+                        viewModel.beginExtrudeArrowEdit()
+                    } label: {
+                        let isCut = (viewModel.toolContext.map { viewModel.resolvedExtrudeBooleanMode(for: $0) == .subtract } ?? false)
+                            || viewModel.extrudeDirectionSign < 0
+                        let pillColor: Color = isCut ? .red : .blue
+                        Text(label.text)
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(pillColor, lineWidth: 1.5))
+                            .foregroundStyle(pillColor)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("ExtrudeArrowValue")
+
+                    if !label.isDiameter && !isBlendArrow {
+                        let isNegative = viewModel.extrudeDirectionSign < 0
+                        Button {
+                            viewModel.flipExtrudeDirection()
+                        } label: {
+                            Image(systemName: isNegative ? "arrow.down.to.line" : "arrow.up.to.line")
+                                .font(.system(size: 11, weight: .bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 5)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+                                .overlay(RoundedRectangle(cornerRadius: 7)
+                                    .stroke(isNegative ? Color.red : Color.blue, lineWidth: 1.5))
+                                .foregroundStyle(isNegative ? Color.red : Color.blue)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Flip Extrude / Cut Direction")
+                        .accessibilityIdentifier("ExtrudeFlipDirection")
+                    }
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("ExtrudeArrowValue")
+
+                if let context = viewModel.toolContext, case .extrude = context.kind, !label.isDiameter {
+                    let resolved = viewModel.resolvedExtrudeBooleanMode(for: context)
+                    let badgeColor: Color = resolved == .subtract ? .red : (resolved == .intersect ? .purple : .blue)
+                    let badgeIcon: String = {
+                        switch resolved {
+                        case .subtract: return "minus.square.fill"
+                        case .union: return "plus.square.on.square"
+                        case .intersect: return "square.on.square.intersection.dashed"
+                        case .newBody, .auto: return "cube.fill"
+                        }
+                    }()
+                    let badgeTitle: String = {
+                        let op: String
+                        switch resolved {
+                        case .subtract: op = "Subtract"
+                        case .union: op = "Union"
+                        case .intersect: op = "Intersect"
+                        case .newBody, .auto: op = "New Body"
+                        }
+                        return context.booleanOverride == .auto ? "Auto (\(op))" : op
+                    }()
+                    Menu {
+                        ForEach(BooleanOverride.allCases, id: \.self) { mode in
+                            Button {
+                                viewModel.setBooleanOverride(mode)
+                            } label: {
+                                Label(
+                                    mode.rawValue,
+                                    systemImage: context.booleanOverride == mode ? "checkmark" : ""
+                                )
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: badgeIcon)
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(badgeTitle)
+                                .font(.caption2.weight(.semibold))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 7, weight: .bold))
+                        }
+                        .foregroundStyle(badgeColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(.regularMaterial, in: Capsule())
+                        .overlay(Capsule().stroke(badgeColor.opacity(0.65), lineWidth: 1))
+                    }
+                    .accessibilityIdentifier("ExtrudeBooleanBadgeMenu")
+                }
 
                 if let context = viewModel.toolContext, case .extrude = context.kind {
                     Menu {
@@ -238,33 +312,53 @@ private struct ExtrudeArrowField: View {
     }
 
     private var pill: some View {
-        TextField("", text: $text)
-            .keyboardType(.numbersAndPunctuation)
-            .autocorrectionDisabled()
-            .multilineTextAlignment(.center)
-            .font(.caption.weight(.semibold))
-            .monospacedDigit()
-            .frame(width: 84)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.blue, lineWidth: 1.5))
-            .focused($focused)
-            .allowsHitTesting(usingSystemKeyboard)
-            .submitLabel(.done)
-            .onSubmit { viewModel.commitExtrudeArrowEdit(text) }
-            .accessibilityIdentifier("ExtrudeArrowField")
-            .contentShape(Rectangle())
-            .onTapGesture { if !usingSystemKeyboard { padOpen = true } }
-            .onAppear {
-                // Seed with the numeric part of the current label.
-                text = (viewModel.extrudeArrowLabel?.text ?? "")
-                    .replacingOccurrences(of: "⌀ ", with: "")
-                    .replacingOccurrences(of: "⌒ ", with: "")
-                    .replacingOccurrences(of: "⟍ ", with: "")
-                    .replacingOccurrences(
-                        of: " " + AppSettings.shared.unit.symbol, with: "")
-                if usingSystemKeyboard { focused = true } else { padOpen = true }
+        let isNegative = viewModel.extrudeDirectionSign < 0
+        return HStack(spacing: 4) {
+            if viewModel.extrudeArrowLabel?.isDiameter != true,
+               case .extrude = viewModel.toolContext?.kind {
+                Button {
+                    viewModel.flipExtrudeDirection()
+                } label: {
+                    Text(isNegative ? "−" : "+")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 22, height: 22)
+                        .background(isNegative ? Color.red.opacity(0.15) : Color.blue.opacity(0.15),
+                                    in: RoundedRectangle(cornerRadius: 5))
+                        .foregroundStyle(isNegative ? Color.red : Color.blue)
+                }
+                .buttonStyle(.plain)
+                .help("Flip Extrude / Cut Direction")
+                .accessibilityIdentifier("ExtrudeArrowFlip")
             }
+            TextField("", text: $text)
+                .keyboardType(.numbersAndPunctuation)
+                .autocorrectionDisabled()
+                .multilineTextAlignment(.center)
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+                .frame(width: 78)
+                .focused($focused)
+                .allowsHitTesting(usingSystemKeyboard)
+                .submitLabel(.done)
+                .onSubmit { viewModel.commitExtrudeArrowEdit(text) }
+                .accessibilityIdentifier("ExtrudeArrowField")
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7)
+            .stroke(isNegative ? Color.red : Color.blue, lineWidth: 1.5))
+        .contentShape(Rectangle())
+        .onTapGesture { if !usingSystemKeyboard { padOpen = true } }
+        .onAppear {
+            // Seed with the numeric part of the current label.
+            text = (viewModel.extrudeArrowLabel?.text ?? "")
+                .replacingOccurrences(of: "⌀ ", with: "")
+                .replacingOccurrences(of: "⌒ ", with: "")
+                .replacingOccurrences(of: "⟍ ", with: "")
+                .replacingOccurrences(
+                    of: " " + AppSettings.shared.unit.symbol, with: "")
+            if usingSystemKeyboard { focused = true } else { padOpen = true }
+        }
     }
 }

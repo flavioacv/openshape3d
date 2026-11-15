@@ -865,16 +865,23 @@ final class EditorViewModel {
         // solid selected body (the real edited result).
         if let preview = toolContext?.preview {
             let replacesSource = facePreviewSource != nil
+            let isSubtractPreview: Bool = {
+                guard let ctx = toolContext, !replacesSource else { return false }
+                return resolvedExtrudeBooleanMode(for: ctx) == .subtract
+            }()
             scene.bodies.append(BodyDrawable(
                 id: preview.id,
                 renderMesh: preview.render,
                 edges: preview.edges,
                 meshRevision: preview.meshRevision,
                 modelMatrix: preview.transform.matrixFloat,
-                baseColor: SIMD4(0.72, 0.74, 0.78, 1),
+                baseColor: isSubtractPreview
+                    ? SIMD4(0.95, 0.26, 0.21, 1)
+                    : SIMD4(0.72, 0.74, 0.78, 1),
                 // The face push/pull result renders as a neutral body (like the
-                // committed result), not an orange "selected" body.
-                selectionState: replacesSource
+                // committed result), not an orange "selected" body. For a cut
+                // preview, use SelectionStateNone so the red baseColor is shown.
+                selectionState: (replacesSource || isSubtractPreview)
                     ? SelectionStateNone.rawValue : SelectionStatePreview.rawValue,
                 isTranslucent: !replacesSource,
                 // A fresh sketch extrude's accent ghost stays uncoloured.
@@ -2443,6 +2450,7 @@ final class EditorViewModel {
     }
 
     func beginMove() {
+        lastDraggedAxis = nil
         // Selected inserted image (plan §B10): the gizmo drags it in-plane.
         if selectedImage != nil {
             axisEntryPart = nil
@@ -2527,6 +2535,14 @@ final class EditorViewModel {
         // Feeds the distance pill riding the gizmo (Shapr3D shows the travelled
         // distance on the handle as you drag).
         moveDragDelta = delta
+        if let part = gizmoHighlight, part.isArrow {
+            let d = SIMD3<Double>(Double(delta.x), Double(delta.y), Double(delta.z))
+            let a = gizmoBasis.axis(part)
+            let dist = simd_dot(d, SIMD3<Double>(Double(a.x), Double(a.y), Double(a.z)))
+            if abs(dist) > 1e-4 {
+                lastDraggedAxis = (part, dist < 0 ? -1 : 1)
+            }
+        }
         if imageInteractionBaseline != nil {
             updateImageMove(delta: delta)
             return
@@ -2857,11 +2873,22 @@ final class EditorViewModel {
     /// Arrow awaiting a typed distance (set by tapping, not dragging, a
     /// gizmo arrow; shows the distance field in NumericInputBar).
     var axisEntryPart: GizmoPart?
+    /// Active direction sign (+1 / -1) for typed gizmo arrow moves so the user
+    /// can flip direction with 1 tap instead of typing negative numbers.
+    var axisEntrySign: Double = 1
+    /// Remembers the last dragged arrow and its direction so tapping the arrow
+    /// right after a drag preserves that direction without requiring `-`.
+    private var lastDraggedAxis: (part: GizmoPart, sign: Double)?
 
     func beginAxisDistanceEntry(_ part: GizmoPart) {
         guard part.isArrow, gizmoOrigin != nil else { return }
         scaleEntryActive = false
         axisEntryPart = part
+        axisEntrySign = (lastDraggedAxis?.part == part) ? (lastDraggedAxis?.sign ?? 1) : 1
+    }
+
+    func flipAxisEntryDirection() {
+        axisEntrySign = axisEntrySign < 0 ? 1 : -1
     }
 
     func cancelAxisDistanceEntry() {
@@ -2907,7 +2934,11 @@ final class EditorViewModel {
             cancelAxisDistanceEntry()
             return
         }
-        commitAxisMove(distance: AppSettings.shared.unit.mm(fromDisplay: typed))
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let hasExplicitSign = trimmed.hasPrefix("-") || trimmed.hasPrefix("+")
+        let signed = hasExplicitSign ? typed : (axisEntrySign < 0 ? -abs(typed) : abs(typed))
+        lastDraggedAxis = nil
+        commitAxisMove(distance: AppSettings.shared.unit.mm(fromDisplay: signed))
     }
 
     /// Move the selection by exactly `distance` along the tapped arrow's axis.
@@ -4095,6 +4126,18 @@ final class EditorViewModel {
     var blendValue2: Double? = nil {
         didSet { if blendValue2 != oldValue { updateBlendPreview() } }
     }
+    /// Whether Fillet/Chamfer propagates across G1-tangent seams (Shapr3D
+    /// DesignHistory.Step.Fillet.includeTangentEdges). Off by default so
+    /// picking one edge blends only that edge and forms a rolling-ball corner
+    /// where it meets existing fillets instead of curving the miter seam up to
+    /// the top face.
+    var blendIncludeTangentEdges: Bool = false {
+        didSet {
+            if blendIncludeTangentEdges != oldValue {
+                updateBlendPreview()
+            }
+        }
+    }
     /// Live result preview: the source body with the pending blend applied,
     /// rendered IN PLACE of the source while the pick is armed (same swap the
     /// face push/pull preview uses). Monotonic revision keeps the GPU cache
@@ -4117,6 +4160,7 @@ final class EditorViewModel {
         selection.removeAll()
         blendValue = 1
         blendValue2 = nil
+        blendIncludeTangentEdges = false
         blendPreview = nil
         mode = .pickingBlendEdges(kind)
     }
@@ -4303,9 +4347,11 @@ final class EditorViewModel {
             let tolerance = OCCTKernel.matchTolerance(for: brep)
             let blended = kind == .fillet
                 ? OCCTKernel.filletResult(brep, at: midpoints, radius: blendValue,
-                                          tolerance: tolerance)
+                                          tolerance: tolerance,
+                                          includeTangentEdges: blendIncludeTangentEdges)
                 : OCCTKernel.chamferResult(brep, at: midpoints, distance: blendValue,
-                                           tolerance: tolerance)
+                                           distance2: blendValue2, tolerance: tolerance,
+                                           includeTangentEdges: blendIncludeTangentEdges)
             switch blended {
             case let .failure(error):
                 blendPreviewFailure = error.message
@@ -4564,10 +4610,23 @@ final class EditorViewModel {
             return
         }
 
+        // Shapr3D parity (`ErrorMessages.cantBlendTangentEdge`): tangent seams
+        // on existing fillets/chamfers cannot receive a new direct blend
+        // unless tangent propagation is explicitly toggled on.
+        if !blendIncludeTangentEdges,
+           let brep = body.brep,
+           let kind = OCCTKernel.edgeKind(brep, atLocalPoint: SIMD3<Double>(nearest.midpoint), tolerance: 0.5),
+           kind == .tangent {
+            errorMessage = "Tangent edges can't be filleted or chamfered."
+            return
+        }
+
         // A curved rim (cylinder top, rounded pocket) tessellates into many
         // short segments; expand the pick to the whole tangent-continuous chain
         // so one tap blends the full rim. A straight edge is its own chain.
-        let chain = EdgeTopology.smoothChain(containing: nearest, in: edges)
+        let chain = EdgeTopology.smoothChain(
+            containing: nearest, in: edges,
+            respectBRepBoundaries: !blendIncludeTangentEdges)
 
         if !selectionAdditive {
             // Shapr3D Parity: Individual selection by default.
@@ -5068,14 +5127,84 @@ final class EditorViewModel {
     var deleteFacePreview: Body?
     private var deleteFacePreviewRevision: UInt64 = 0
 
-    /// Arm Delete Face from the Modify palette. The next taps toggle faces.
+    /// Arm Delete Face from the Modify palette. When a single face (such as a
+    /// rounded fillet corner or planar face) is ALREADY selected in
+    /// `.faceSelected` mode, pre-populate `deleteFaceTargets` with that face
+    /// and compute its healed preview immediately so the user sees the restored
+    /// sharp corner right away.
     func beginDeleteFace() {
+        var preselectedBodyID: BodyID?
+        var preselectedSeed: Int?
+        if case let .faceSelected(bodyID) = mode,
+           let seed = toolContext?.faceTriangles.first {
+            preselectedBodyID = bodyID
+            preselectedSeed = seed
+        }
         cancelTransientPicks()
         cancelTool()
         deleteFaceTargets = []
-        deleteFaceBodyID = selection.count == 1 ? selection.first : nil
+        deleteFaceBodyID = preselectedBodyID ?? (selection.count == 1 ? selection.first : nil)
         deleteFacePreview = nil
         mode = .pickingDeleteFaces
+        if let bodyID = preselectedBodyID,
+           let seed = preselectedSeed,
+           let body = session.document.body(with: bodyID),
+           body.brep != nil,
+           let target = DeleteFaceKit.target(in: body.render, seedTriangle: seed) {
+            deleteFaceBodyID = bodyID
+            deleteFaceTargets = [target]
+            updateDeleteFacePreview()
+        }
+    }
+
+    /// Whether the currently selected face in `.faceSelected` mode can be
+    /// healed/deleted locally (Shapr3D parity: selecting a rounded corner
+    /// fillet, chamfer, or hole face and tapping Delete Face heals that face
+    /// back into a sharp corner without touching adjacent faces).
+    var canDeleteSelectedFace: Bool {
+        guard case let .faceSelected(bodyID) = mode,
+              let seed = toolContext?.faceTriangles.first,
+              let body = session.document.body(with: bodyID),
+              let brep = body.brep,
+              let target = DeleteFaceKit.target(in: body.render, seedTriangle: seed)
+        else { return false }
+        // All triangles of the body cannot be deleted as a single face heal.
+        guard target.triangles.count < body.render.triangleCount else { return false }
+        return OCCTKernel.removingFaces(
+            brep, at: [target.samplePoint],
+            tolerance: OCCTKernel.matchTolerance(for: brep)) != nil
+    }
+
+    /// Directly remove and heal the currently selected face in `.faceSelected`
+    /// mode (Shapr3D 1-tap Delete Face / Heal Corner workflow). Returns true
+    /// when the face was healed locally, or false if the face could not be
+    /// healed.
+    @discardableResult
+    func deleteSelectedFace() -> Bool {
+        guard case let .faceSelected(bodyID) = mode,
+              let seed = toolContext?.faceTriangles.first,
+              let source = session.document.body(with: bodyID),
+              source.brep != nil,
+              let target = DeleteFaceKit.target(in: source.render, seedTriangle: seed),
+              target.triangles.count < source.render.triangleCount
+        else { return false }
+
+        cancelTransientPicks()
+        cancelTool()
+        mode = .pickingDeleteFaces
+        deleteFaceBodyID = bodyID
+        deleteFaceTargets = [target]
+        updateDeleteFacePreview()
+        guard deleteFacePreview != nil else {
+            resetDeleteFaceState()
+            mode = .selected(bodyID)
+            selection = [bodyID]
+            reportFailure("The surrounding faces could not heal — "
+                + "try deleting fewer faces, or a different one.")
+            return false
+        }
+        commitDeleteFace()
+        return true
     }
 
     /// Re-enter face picking for an existing delete-face node, seeded with
@@ -5653,10 +5782,11 @@ final class EditorViewModel {
     /// Distance from a point to a segment (both body-local).
     /// Screen-sized edge target for a plain tap: within `edgeTapPoints` of
     /// a sharp edge the tap means that edge, not the face beside it. Kept
-    /// tight (a thin wall at model-mode zoom is only a few points tall, and
-    /// its centre must still read as the wall — CylinderGrowShotUITests),
-    /// and limited to sharp dihedrals so tessellation seams never count.
-    static let edgeTapPoints: Double = 16
+    /// tight (~6.5 pt on desktop/pointer) so narrow faces like chamfers and
+    /// thin walls remain selectable inside their interior without triggering
+    /// Chamfer/Fillet, and limited to sharp dihedrals so tessellation seams
+    /// never count.
+    static let edgeTapPoints: Double = 6.5
     static let edgeTapMinimumDihedralDegrees: Float = 15
 
     private func tapIsNearBodyEdge(hit: PickHit, body: Body) -> Bool {
@@ -5670,8 +5800,25 @@ final class EditorViewModel {
         let inverse = simd_inverse(body.transform.matrixFloat)
         let local4 = inverse * SIMD4(hit.worldPoint, 1)
         let local = SIMD3<Float>(local4.x, local4.y, local4.z)
-        // Shapr3D touch-friendly cone: 16 points for planar faces; 10 points on curved faces to allow selecting fillet edges without breaking wall drag
-        let points = isCurved ? (Self.edgeTapPoints * 0.65) : Self.edgeTapPoints
+        let points = isCurved ? 4.5 : Self.edgeTapPoints
+
+        // Prefer true 2D screen-space distance when the camera is available so
+        // perspective depth and foreshortened faces don't inflate the edge band.
+        if let control = cameraControl,
+           let tapScreen = control.worldToScreenPoint(SIMD3<Double>(hit.worldPoint)) {
+            let matrix = body.transform.matrixFloat
+            return sharp.contains { edge in
+                let ab = edge.end - edge.start
+                let len2 = simd_dot(ab, ab)
+                let t = len2 > 1e-12 ? max(0, min(1, simd_dot(local - edge.start, ab) / len2)) : 0
+                let closestWorld4 = matrix * SIMD4(edge.start + ab * t, 1)
+                guard let edgeScreen = control.worldToScreenPoint(
+                    SIMD3<Double>(Double(closestWorld4.x), Double(closestWorld4.y), Double(closestWorld4.z))
+                ) else { return false }
+                return hypot(tapScreen.x - edgeScreen.x, tapScreen.y - edgeScreen.y) <= points
+            }
+        }
+
         let tolerance = Float(points * worldPerPoint / max(body.transform.scale, 1e-9))
         return sharp.contains { Self.pointSegmentDistance(local, $0.start, $0.end) <= tolerance }
     }
@@ -6217,6 +6364,14 @@ final class EditorViewModel {
             selection.removeAll()
             cancelTool()
             mode = .idle
+            return
+        }
+        // Shapr3D parity: when a single face (such as a rounded fillet corner,
+        // chamfer, or hole wall) is selected on an analytic B-Rep body in
+        // `.faceSelected` mode, Delete heals that face locally instead of
+        // deleting the entire body.
+        if case .faceSelected = mode, canDeleteSelectedFace {
+            deleteSelectedFace()
             return
         }
         guard !selection.isEmpty else { return }
@@ -7048,6 +7203,7 @@ final class EditorViewModel {
         // Any viewport tap dismisses pending gizmo numeric entry and an
         // Items plane selection.
         axisEntryPart = nil
+        lastDraggedAxis = nil
         selectedPlaneID = nil
         // Visualization dresses whole bodies (spec §14): a tap selects the
         // body under it (Shift/⌘ adds or removes it), never a face, and
@@ -7210,7 +7366,11 @@ final class EditorViewModel {
         edges: [SelectableEdge]
     ) -> [SelectableEdge] {
         // 1. Try smooth / tangent continuous chain first (e.g. cylinder rims, fillet seams)
-        let smoothChain = EdgeTopology.smoothChain(containing: nearest, in: edges)
+        let smoothChain = EdgeTopology.smoothChain(
+            containing: nearest,
+            in: edges,
+            respectBRepBoundaries: false
+        )
         if smoothChain.count > 1 {
             return smoothChain
         }
@@ -7328,7 +7488,15 @@ final class EditorViewModel {
                 if cyl.matchesWholeBody {
                     beginCylinderRadial(body: body, cylinder: cyl, hit: hit)
                 } else {
-                    mode = .selected(hit.bodyID) // curved but compound → whole body
+                    // Partial/compound cylindrical face (e.g. a 90° fillet corner
+                    // or bore): select the curved face itself (Shapr3D parity) so
+                    // it highlights and exposes Delete Face / corner healing.
+                    toolContext = curvedFaceContext(body: body, triangles: cyl.triangles,
+                                                    seedTriangle: hit.triangleIndex)
+                    faceMoveActive = false
+                    faceScaleActive = false
+                    faceRotateActive = false
+                    mode = .faceSelected(body.id)
                 }
                 return
             }
@@ -7401,7 +7569,7 @@ final class EditorViewModel {
 
     /// Shapr3D cone-picking: captures nearby silhouette edges when tapping in the empty canvas just outside a solid
     private func nearestSilhouetteEdgeHit(ray: Ray) -> SilhouetteEdgeHit? {
-        let thresholdPoints: Float = 18.0
+        let thresholdPoints: Float = 10.0
         let thresholdWorld = thresholdPoints * Float(worldPerPoint)
         var bestHit: SilhouetteEdgeHit?
         var minDistance: Float = thresholdWorld
@@ -8550,6 +8718,92 @@ final class EditorViewModel {
         return true
     }
 
+    private func hitsPreviewBody(_ preview: Body, ray: Ray) -> Bool {
+        let previewScene = ViewportScene(bodies: [BodyDrawable(
+            id: preview.id,
+            renderMesh: preview.render,
+            edges: preview.edges,
+            meshRevision: preview.meshRevision,
+            modelMatrix: preview.transform.matrixFloat,
+            baseColor: SIMD4(0.2, 0.55, 0.98, 1),
+            selectionState: SelectionStateNone.rawValue
+        )])
+        return HitTester.pickBody(ray: ray, in: previewScene) != nil
+    }
+
+    /// True when `ray` hits the active tool's preview solid or source sketch
+    /// profile/face during `.extruding` (or `.revolve`). Dragging the arrow or
+    /// the extruded profile/preview scrubs the distance; dragging empty space
+    /// or surrounding bodies orbits the camera (Shapr3D §4.1).
+    func hitsActiveToolTarget(ray: Ray) -> Bool {
+        guard let context = toolContext else { return false }
+        switch context.kind {
+        case .revolve:
+            // Revolve angle scrubbing can be grabbed from the preview or profile.
+            if let preview = context.preview, hitsPreviewBody(preview, ray: ray) {
+                return true
+            }
+            if let hit = profileHit(ray: ray), hit.sketchID == context.sketchID {
+                return true
+            }
+            return false
+        case .extrude, .offsetPlane:
+            if let preview = context.preview, !context.previewReplacesSource,
+               hitsPreviewBody(preview, ray: ray) {
+                return true
+            }
+            if context.isFaceOperation, let sourceID = context.sourceBody,
+               let hit = HitTester.pickBody(ray: ray, in: scene),
+               hit.bodyID == sourceID {
+                return true
+            }
+            if let hit = profileHit(ray: ray), hit.sketchID == context.sketchID,
+               (hit.profile.sourceEntityIDs == context.profile.sourceEntityIDs
+                || context.extraProfiles.contains(where: { $0.profile.sourceEntityIDs == hit.profile.sourceEntityIDs })) {
+                return true
+            }
+            return false
+        case .sweep, .loft, .wrap:
+            return false
+        }
+    }
+
+    /// Resolved boolean mode for the active extrude (`Auto` resolved dynamically
+    /// from drag direction and body intersection: pushing into a body -> `.subtract`,
+    /// overlapping/extending a body -> `.union`, touching nothing -> `.newBody`).
+    func resolvedExtrudeBooleanMode(for context: ToolContext) -> BooleanOverride {
+        if context.booleanOverride != .auto {
+            return context.booleanOverride
+        }
+        guard case .extrude(let distance) = context.kind else {
+            return .auto
+        }
+        if context.isFaceOperation {
+            return distance < -1e-4 ? .subtract : .union
+        }
+        guard abs(distance) > 1e-4 else {
+            return .newBody
+        }
+        let n = context.plane.normal
+        let sign: Double = distance >= 0 ? 1 : -1
+        let sampleWorld = context.plane.toWorld(context.profile.centroid) + n * sign * 0.01
+        let sample = Vector(sampleWorld.x, sampleWorld.y, sampleWorld.z)
+        let toolBounds = context.preview?.euclidMesh().bounds
+        for target in booleanCandidates(for: context) {
+            let bounds = Self.worldBounds(of: target)
+            if bounds.intersects(sample) {
+                let worldTarget = target.euclidMesh().transformed(by: target.transform.euclid)
+                if worldTarget.intersects(sample) {
+                    return .subtract
+                }
+            }
+            if let tb = toolBounds, tb.intersects(bounds) {
+                return .union
+            }
+        }
+        return .newBody
+    }
+
     /// Drag starting on the selected face pulls it (push/pull on bodies).
     func beginFacePull(ray: Ray) -> Bool {
         guard case .faceSelected(let bodyID) = mode,
@@ -8800,6 +9054,9 @@ final class EditorViewModel {
 
     func setExtrudeDistance(_ distance: Double) {
         guard var context = toolContext, case .extrude(let current) = context.kind else { return }
+        if abs(distance) > 1e-4 {
+            extrudeDirectionSign = distance < 0 ? -1 : 1
+        }
         // A pan delivers `.changed` at up to the display rate; snapping and
         // sub-pixel jitter make many consecutive events resolve to the SAME
         // distance. Skip the (expensive) CSG rebuild when nothing moved so the
@@ -8821,6 +9078,24 @@ final class EditorViewModel {
 
     /// True while the on-arrow value pill is being typed into.
     var editingExtrudeArrow = false
+    /// Active pull/cut direction sign (+1 outward, -1 inward) so the user can
+    /// flip direction with 1 click without typing negative numbers.
+    var extrudeDirectionSign: Double = 1
+
+    func flipExtrudeDirection() {
+        extrudeDirectionSign = extrudeDirectionSign < 0 ? 1 : -1
+        guard var context = toolContext else { return }
+        switch context.kind {
+        case .extrude(let distance) where abs(distance) > 1e-4:
+            context.kind = .extrude(distance: -distance)
+            rebuildToolPreview(&context)
+            toolContext = context
+        case .offsetPlane(let distance) where abs(distance) > 1e-4:
+            setOffsetPlaneDistance(-distance)
+        default:
+            break
+        }
+    }
 
     /// The editable value pill riding the extrude/diameter arrow, or nil.
     var extrudeArrowLabel: ExtrudeArrowLabel? {
@@ -8875,14 +9150,17 @@ final class EditorViewModel {
             setExtrudeDistance(value / 2 - cyl.radius)
         } else {
             // Honor an explicitly typed sign ("-5" pushes inward); when no sign
-            // is typed, keep the current drag direction (the pill shows |dist|).
-            let hasExplicitSign = text.contains("-") || text.contains("+")
+            // is typed, follow the active extrudeDirectionSign so the user
+            // never needs to type "-" after flipping direction.
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            let hasExplicitSign = trimmed.hasPrefix("-") || trimmed.hasPrefix("+")
             let signed: Double
             if hasExplicitSign {
                 signed = value
             } else {
-                signed = (context.distance ?? 0) < 0 ? -abs(value) : abs(value)
+                signed = extrudeDirectionSign < 0 ? -abs(value) : abs(value)
             }
+            guard abs(signed) > 1e-4 else { return }
             setExtrudeDistance(context.symmetric ? signed / 2 : signed)
         }
         commitTool()
@@ -9538,6 +9816,7 @@ final class EditorViewModel {
     func cancelTool() {
         toolContext = nil
         extrudeDragAnchor = nil
+        extrudeDirectionSign = 1
         cachedPullWorldBody = nil
         faceMoveActive = false
         faceScaleActive = false

@@ -27,6 +27,11 @@ nonisolated struct SelectableEdge: Equatable, Sendable {
     var normalA: SIMD3<Float>
     var normalB: SIMD3<Float>
     var isConvex: Bool
+    /// 1-based OCCT B-Rep face indices bordering this edge (0 when unknown).
+    /// Used to keep single-tap edge selection bounded by real B-Rep vertices
+    /// (e.g., separating a straight edge from an adjacent fillet arc).
+    var faceRegionA: UInt32 = 0
+    var faceRegionB: UInt32 = 0
 
     var midpoint: SIMD3<Float> { (start + end) / 2 }
     var length: Float { simd_length(end - start) }
@@ -34,6 +39,11 @@ nonisolated struct SelectableEdge: Equatable, Sendable {
         let d = end - start
         let l = simd_length(d)
         return l > 1e-9 ? d / l : SIMD3<Float>(0, 0, 1)
+    }
+
+    var sortedFaceRegions: (UInt32, UInt32)? {
+        guard faceRegionA > 0, faceRegionB > 0 else { return nil }
+        return faceRegionA <= faceRegionB ? (faceRegionA, faceRegionB) : (faceRegionB, faceRegionA)
     }
 }
 
@@ -66,6 +76,8 @@ nonisolated enum EdgeTopology {
         var normalA: SIMD3<Float>
         var normalB: SIMD3<Float>
         var isConvex: Bool
+        var regionA: UInt32 = 0
+        var regionB: UInt32 = 0
     }
 
     /// One triangle's side of an edge: its outward normal, and whether its
@@ -73,6 +85,7 @@ nonisolated enum EdgeTopology {
     private struct EdgeSide {
         var normal: SIMD3<Float>
         var forward: Bool
+        var region: UInt32 = 0
     }
 
     static func selectableEdges(
@@ -99,11 +112,13 @@ nonisolated enum EdgeTopology {
 
         // 2. Map each undirected topo edge → its adjacent faces.
         var edgeFaces = [EdgeKey: [EdgeSide]]()
+        let regions = mesh.validFaceRegions
         var triangle = 0
         while triangle < mesh.triangleCount {
             let i0 = Int(mesh.indices[triangle * 3])
             let i1 = Int(mesh.indices[triangle * 3 + 1])
             let i2 = Int(mesh.indices[triangle * 3 + 2])
+            let reg = regions?[triangle] ?? 0
             triangle += 1
             let p0 = mesh.positions[i0], p1 = mesh.positions[i1], p2 = mesh.positions[i2]
             let cross = simd_cross(p1 - p0, p2 - p0)
@@ -112,9 +127,9 @@ nonisolated enum EdgeTopology {
             let normal = cross / area
             let t0 = topoID[i0], t1 = topoID[i1], t2 = topoID[i2]
             guard t0 != t1, t1 != t2, t2 != t0 else { continue }
-            edgeFaces[EdgeKey(t0, t1), default: []].append(EdgeSide(normal: normal, forward: t0 < t1))
-            edgeFaces[EdgeKey(t1, t2), default: []].append(EdgeSide(normal: normal, forward: t1 < t2))
-            edgeFaces[EdgeKey(t2, t0), default: []].append(EdgeSide(normal: normal, forward: t2 < t0))
+            edgeFaces[EdgeKey(t0, t1), default: []].append(EdgeSide(normal: normal, forward: t0 < t1, region: reg))
+            edgeFaces[EdgeKey(t1, t2), default: []].append(EdgeSide(normal: normal, forward: t1 < t2, region: reg))
+            edgeFaces[EdgeKey(t2, t0), default: []].append(EdgeSide(normal: normal, forward: t2 < t0, region: reg))
         }
 
         // 3. Keep manifold crease edges (exactly 2 faces meeting past the
@@ -131,7 +146,9 @@ nonisolated enum EdgeTopology {
                     isConvex: isConvexEdge(
                         from: topoPositions[edge.a], to: topoPositions[edge.b],
                         sideA: sides[0], sideB: sides[1],
-                        centroid: centroid)))
+                        centroid: centroid),
+                    regionA: sides[0].region,
+                    regionB: sides[1].region))
             }
         }
 
@@ -148,7 +165,9 @@ nonisolated enum EdgeTopology {
                 end: end,
                 normalA: edge.normalA,
                 normalB: edge.normalB,
-                isConvex: edge.isConvex
+                isConvex: edge.isConvex,
+                faceRegionA: edge.regionA,
+                faceRegionB: edge.regionB
             )
         }
     }
@@ -180,6 +199,8 @@ nonisolated enum EdgeTopology {
             // Never merge a convex piece into a concave one: the span takes
             // one flag, and a blend applies it to the whole length.
             let convex: Bool
+            let rLo: UInt32
+            let rHi: UInt32
         }
 
         var buckets = [BucketKey: [RawEdge]]()
@@ -199,7 +220,8 @@ nonisolated enum EdgeTopology {
             // Face-pair key (order-independent).
             let n0 = qv(e.normalA, 1e3), n1 = qv(e.normalB, 1e3)
             let key = BucketKey(line: qv(anchor, 1e4), dir: qv(cd, 1e3),
-                                na: min(n0, n1), nb: max(n0, n1), convex: e.isConvex)
+                                na: min(n0, n1), nb: max(n0, n1), convex: e.isConvex,
+                                rLo: min(e.regionA, e.regionB), rHi: max(e.regionA, e.regionB))
             buckets[key, default: []].append(e)
         }
 
@@ -229,7 +251,8 @@ nonisolated enum EdgeTopology {
             func emit(_ span: Interval) {
                 result.append(RawEdge(a: span.loV, b: span.hiV,
                                       normalA: first.normalA, normalB: first.normalB,
-                                      isConvex: first.isConvex))
+                                      isConvex: first.isConvex,
+                                      regionA: first.regionA, regionB: first.regionB))
             }
             var span = intervals[0]
             for next in intervals.dropFirst() {
@@ -258,12 +281,14 @@ nonisolated enum EdgeTopology {
     static func smoothChain(
         containing seed: SelectableEdge,
         in edges: [SelectableEdge],
-        maxTurnDegrees: Float = 35
+        maxTurnDegrees: Float = 35,
+        respectBRepBoundaries: Bool = true
     ) -> [SelectableEdge] {
         guard let seedIndex = edges.firstIndex(where: {
             simd_length($0.midpoint - seed.midpoint) < 1e-4
         }) else { return [seed] }
         let cosTurn = cos(maxTurnDegrees * .pi / 180)
+        let seedRegions = seed.sortedFaceRegions
 
         var byEndpoint = [PositionKey: [Int]]()
         for (i, e) in edges.enumerated() {
@@ -274,7 +299,16 @@ nonisolated enum EdgeTopology {
         // Two segments continue each other when the edge direction stays within
         // the turn threshold AND their face pairs match up side-for-side (the
         // cap normal tracks the cap, the wall normal tracks the wall).
+        // When `respectBRepBoundaries` is true (single-tap selection), stop at
+        // B-Rep vertices where the adjacent OCCT face pair changes so a straight
+        // edge never merges into an adjacent fillet arc.
         func continues(_ a: SelectableEdge, _ b: SelectableEdge) -> Bool {
+            if respectBRepBoundaries,
+               let sr = seedRegions,
+               let br = b.sortedFaceRegions,
+               sr != br {
+                return false
+            }
             guard abs(simd_dot(a.direction, b.direction)) >= cosTurn else { return false }
             let direct = min(simd_dot(a.normalA, b.normalA), simd_dot(a.normalB, b.normalB))
             let swapped = min(simd_dot(a.normalA, b.normalB), simd_dot(a.normalB, b.normalA))

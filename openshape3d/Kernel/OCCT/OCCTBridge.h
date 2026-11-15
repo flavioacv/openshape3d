@@ -298,13 +298,31 @@ typedef NS_ENUM(NSInteger, OCCTOpCode) {
 /// Build a primitive matching Euclid's conventions exactly (base sits on y=0;
 /// cylinder axis is +Y), so the B-rep coincides with the Euclid CSG mesh.
 /// `kind`: 0 = box (a=width, b=depth, c=height), 1 = cylinder (a=radius,
-/// b=height), 2 = sphere (a=radius). `transform` is 12 packed doubles
-/// (row-major 3×4 placement) or nil for identity.
+/// b=height), 2 = sphere (a=radius), 3 = cone (a=bottomRadius, b=topRadius,
+/// c=height), 4 = torus (a=majorRadius, b=minorRadius), 5 = wedge (a=dx,
+/// b=dy, c=dz), 6 = tube (a=outerRadius, b=innerRadius, c=height).
+/// `transform` is 12 packed doubles (row-major 3×4 placement) or nil.
 + (nullable OCCTShape *)primitiveShapeOfKind:(NSInteger)kind
                                            a:(double)a
                                            b:(double)b
                                            c:(double)c
                                    transform:(nullable NSData *)transform;
+
+/// Build a regular N-sided prism (e.g. sides=6 for hex nuts/bolt heads),
+/// base on y=0, axis +Y.
++ (nullable OCCTShape *)polygonalPrismWithSides:(NSInteger)sides
+                                         radius:(double)radius
+                                         height:(double)height
+                                      transform:(nullable NSData *)transform;
+
+/// Asymmetric two-sided extrusion from a sketch loop (`distancePositive` along
+/// +normal, `distanceNegative` along -normal; both >= 0 and sum > 0).
++ (nullable OCCTShape *)extrudedTwoSidesShapeWithOuterLoop:(NSData *)outerLoop
+                                                     holes:(NSArray<NSData *> *)holes
+                                                     basis:(OCCTPlaneBasis *)basis
+                                          distancePositive:(double)distancePositive
+                                          distanceNegative:(double)distanceNegative
+                                                   history:(nullable OCCTShapeHistory *)history;
 
 /// Apply a rigid placement to a solid. `transform` is 12 packed doubles
 /// (row-major 3×4). Needed because a `Body` carries its own transform, which
@@ -403,6 +421,12 @@ typedef NS_ENUM(NSInteger, OCCTOpCode) {
                                radius:(double)radius
                             tolerance:(double)tolerance
                                status:(nullable OCCTOpStatus *)status;
++ (nullable OCCTShape *)filletedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                               radius:(double)radius
+                            tolerance:(double)tolerance
+                  includeTangentEdges:(BOOL)includeTangentEdges
+                               status:(nullable OCCTOpStatus *)status;
 
 /// Bevel the edges near `worldPoints` by `distance`
 /// (`BRepFilletAPI_MakeChamfer`) — the chamfer half of spec §4.3. Same
@@ -412,6 +436,19 @@ typedef NS_ENUM(NSInteger, OCCTOpCode) {
                         atWorldPoints:(NSData *)worldPoints
                              distance:(double)distance
                             tolerance:(double)tolerance
+                                status:(nullable OCCTOpStatus *)status;
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                             distance:(double)distance
+                            distance2:(double)distance2
+                            tolerance:(double)tolerance
+                                status:(nullable OCCTOpStatus *)status;
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                        atWorldPoints:(NSData *)worldPoints
+                             distance:(double)distance
+                            distance2:(double)distance2
+                            tolerance:(double)tolerance
+                  includeTangentEdges:(BOOL)includeTangentEdges
                                 status:(nullable OCCTOpStatus *)status;
 
 /// Hollow a solid to a wall of `thickness`, opening the faces near
@@ -476,6 +513,29 @@ typedef NS_ENUM(NSInteger, OCCTOpCode) {
                                 status:(nullable OCCTOpStatus *)status
                                history:(nullable OCCTShapeHistory *)history;
 
+/// Variable-radius fillet along edges near `worldPoints` (`startRadius` at
+/// first vertex to `endRadius` at last vertex via `BRepFilletAPI_MakeFillet`).
++ (nullable OCCTShape *)variableFilletedShape:(OCCTShape *)shape
+                                atWorldPoints:(NSData *)worldPoints
+                                  startRadius:(double)startRadius
+                                    endRadius:(double)endRadius
+                                    tolerance:(double)tolerance
+                                       status:(nullable OCCTOpStatus *)status
+                                      history:(nullable OCCTShapeHistory *)history;
+
+/// Thicken an open shell/face or solid by `thickness` (mm), producing a
+/// watertight solid (`BRepOffsetAPI_MakeThickSolid` / offset fallback).
++ (nullable OCCTShape *)thickenedShape:(OCCTShape *)shape
+                             thickness:(double)thickness
+                             tolerance:(double)tolerance
+                                status:(nullable OCCTOpStatus *)status;
++ (nullable OCCTShape *)chamferedShape:(OCCTShape *)shape
+                           edgeIndices:(NSData *)edgeIndices
+                              distance:(double)distance
+                             distance2:(double)distance2
+                                status:(nullable OCCTOpStatus *)status
+                               history:(nullable OCCTShapeHistory *)history;
+
 /// Modifier-op ancestry (step 5): shell and delete-face with the same
 /// fill-only `history` the boolean carries — untouched faces report `same`,
 /// offset/healed faces `modified`, new faces `generated` — so these ops
@@ -535,6 +595,26 @@ typedef NS_ENUM(NSInteger, OCCTOpCode) {
 /// on purpose: they carry no pair identity, and they are exactly the edges
 /// the blend pre-qualifier vetoes anyway.
 + (nullable NSData *)edgeFaceAdjacencyOfShape:(OCCTShape *)shape;
+
+/// Every edge with its geometric/topological classification, as packed
+/// int32 quadruples `(edgeIndex, kindCode, faceA, faceB)` in 1-based
+/// indexed-map order:
+///   kindCode: 0 = border/seam (not blendable), 1 = tangent (G1+, smooth),
+///             2 = convex (outer sharp corner), 3 = concave (inner sharp corner).
+/// `faceA` and `faceB` are 0 when the edge has fewer than 2 distinct faces.
++ (nullable NSData *)edgeDiagnosticsOfShape:(OCCTShape *)shape;
+
+/// Exact minimum B-rep distance (mm) between two shapes via
+/// `BRepExtrema_DistShapeShape`. Returns 0 when touching/intersecting,
+/// or -1 on invalid input / failure.
++ (double)minimumDistanceBetweenShape:(OCCTShape *)shapeA
+                             andShape:(OCCTShape *)shapeB;
+
+/// Sew open faces/shells together (`BRepBuilderAPI_Sewing`) and attempt to
+/// close into a valid solid (`BRepBuilderAPI_MakeSolid` + healing) for
+/// 3D printing / watertight modeling. Nil on failure.
++ (nullable OCCTShape *)sewShapes:(NSArray<OCCTShape *> *)shapes
+                        tolerance:(double)tolerance;
 
 /// The 1-based index of the edge nearest the world point (within
 /// `tolerance`), 0 when none — the mint-time bridge from a picked mesh edge

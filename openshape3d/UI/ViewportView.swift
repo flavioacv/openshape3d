@@ -224,6 +224,15 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
             sceneDidChange()
             return
         }
+        // Tapping (not dragging) the pull arrow opens inline distance entry
+        // directly instead of falling through to a scene raycast that can miss
+        // the body and cancel/commit the tool.
+        if let arrow = viewModel.pullArrowState,
+           hitsPullArrowScreen(point: point, arrow: arrow) {
+            viewModel.beginExtrudeArrowEdit()
+            sceneDidChange()
+            return
+        }
         // Tapping (not dragging) a gizmo handle opens exact numeric entry:
         // a distance on an arrow, an angle on a rotation ring.
         if let part = gizmoPart(at: point) {
@@ -486,10 +495,18 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
             return viewModel.beginSketchStroke(ray: ray)
         }
 
-        // Extruding: drags adjust the pull distance / revolve angle.
+        // Extruding: grabbing the pull arrow or the extruded profile/preview
+        // scrubs the pull distance / revolve angle; dragging anywhere else
+        // orbits the camera so the user can inspect cut depth and alignment
+        // mid-extrude (Shapr3D §4.1).
         if case .extruding = viewModel.mode {
-            pullActive = viewModel.beginToolDrag(ray: ray)
-            return pullActive
+            let hitsHandle = viewModel.pullArrowState.map { hitsPullArrowScreen(point: point, arrow: $0) } ?? false
+            let hitsTarget = viewModel.hitsActiveToolTarget(ray: ray)
+            if hitsHandle || hitsTarget {
+                pullActive = viewModel.beginToolDrag(ray: ray)
+                return pullActive
+            }
+            return false
         }
 
         // Waiting for an axis tap: don't let a stray drag start a new pull.
@@ -621,7 +638,12 @@ final class ViewportCoordinator: NSObject, ViewportGestureDelegate, ViewportCame
                     return true
                 }
             }
-            return false   // drags off the handles orbit; the face stays put
+            if !viewModel.faceMoveActive, !viewModel.faceScaleActive, !viewModel.faceRotateActive,
+               viewModel.beginFacePull(ray: ray) {
+                pullActive = true
+                return true
+            }
+            return false   // drags off the face/handles orbit; the face stays put
         }
 
         // Offer the drag to the gizmo when a body is selected. The part is

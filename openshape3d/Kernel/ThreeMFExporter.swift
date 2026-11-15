@@ -14,11 +14,11 @@ import simd
 
 nonisolated enum ThreeMFExporter {
 
-    static func threeMF(bodies: [Body]) -> Data {
+    static func threeMF(bodies: [Body], resolution: PrintMeshResolution = .standard) -> Data {
         var zip = MinimalZipWriter()
         zip.addFile(path: "[Content_Types].xml", data: Data(contentTypesXML.utf8))
         zip.addFile(path: "_rels/.rels", data: Data(relsXML.utf8))
-        zip.addFile(path: "3D/3dmodel.model", data: Data(modelXML(bodies: bodies).utf8))
+        zip.addFile(path: "3D/3dmodel.model", data: Data(modelXML(bodies: bodies, resolution: resolution).utf8))
         return zip.finish()
     }
 
@@ -37,7 +37,7 @@ nonisolated enum ThreeMFExporter {
     </Relationships>
     """
 
-    static func modelXML(bodies: [Body]) -> String {
+    static func modelXML(bodies: [Body], resolution: PrintMeshResolution = .standard) -> String {
         var out = """
         <?xml version="1.0" encoding="UTF-8"?>
         <model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
@@ -46,14 +46,13 @@ nonisolated enum ThreeMFExporter {
         out += "\n"
         for (index, body) in bodies.enumerated() {
             let objectID = index + 1
+            let mesh = PrintExportKit.worldMesh(for: body, resolution: resolution)
             out += "<object id=\"\(objectID)\" type=\"model\">\n<mesh>\n<vertices>\n"
-            let transform = body.transform
-            for p in body.render.positions {
-                let w = transform.applying(to: SIMD3<Double>(p))
-                out += String(format: "<vertex x=\"%.6f\" y=\"%.6f\" z=\"%.6f\"/>\n", w.x, w.y, w.z)
+            for w in mesh.positions {
+                out += String(format: "<vertex x=\"%.6f\" y=\"%.6f\" z=\"%.6f\"/>\n", Double(w.x), Double(w.y), Double(w.z))
             }
             out += "</vertices>\n<triangles>\n"
-            let indices = body.render.indices
+            let indices = mesh.indices
             var i = 0
             while i + 2 < indices.count {
                 out += "<triangle v1=\"\(indices[i])\" v2=\"\(indices[i + 1])\" v3=\"\(indices[i + 2])\"/>\n"

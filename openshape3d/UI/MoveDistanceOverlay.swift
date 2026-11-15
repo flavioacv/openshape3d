@@ -133,10 +133,22 @@ private struct MoveDistanceField: View {
     }
 
     private var pill: some View {
-        HStack(spacing: 4) {
-            Text(part.axisName)
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.secondary)
+        let isNegative = viewModel.axisEntrySign < 0
+        return HStack(spacing: 4) {
+            Button {
+                viewModel.flipAxisEntryDirection()
+            } label: {
+                Text("\(isNegative ? "−" : "+")\(part.axisName)")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background((isNegative ? Color.orange : Color.blue).opacity(0.15),
+                                in: RoundedRectangle(cornerRadius: 4))
+                    .foregroundStyle(isNegative ? Color.orange : Color.blue)
+            }
+            .buttonStyle(.plain)
+            .help("Flip Axis Direction")
+            .accessibilityIdentifier("MoveDistanceFlip")
             TextField(AppSettings.shared.unit.symbol, text: $text)
                 .keyboardType(.numbersAndPunctuation)
                 .autocorrectionDisabled()

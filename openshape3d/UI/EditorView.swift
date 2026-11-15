@@ -492,6 +492,13 @@ struct EditorView: View {
                     .fixedSize()
             }
             Divider().frame(height: 20)
+            Toggle("Tangent", isOn: Binding(
+                get: { viewModel.blendIncludeTangentEdges },
+                set: { viewModel.blendIncludeTangentEdges = $0 }
+            ))
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .accessibilityIdentifier("BlendIncludeTangentEdgesToggle")
             if kind == .chamfer {
                 Picker("Chamfer Mode", selection: Binding(
                     get: { viewModel.chamferMode },
@@ -1965,9 +1972,29 @@ struct EditorView: View {
                                 : viewModel.faceRotateActive
                                     ? "Rotate face — drag a ring to tilt the solid"
                                     : viewModel.toolContext?.curvedRegion == true
-                                        ? "Curved face — no push/pull or transform"
-                                        : "Face selected — drag it to push or pull")
+                                        ? (viewModel.canDeleteSelectedFace
+                                            ? "Curved face selected — Delete Face to heal corner"
+                                            : "Curved face — no push/pull or transform")
+                                        : "Face selected — drag to push or pull")
                     ) {
+                        if viewModel.canDeleteSelectedFace {
+                            Button(role: .destructive) {
+                                viewModel.deleteSelectedFace()
+                            } label: {
+                                Label("Delete Face", systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("FaceSelectedDeleteFaceButton")
+                        }
+                        if viewModel.toolContext?.curvedRegion != true {
+                            Button("Offset Plane") {
+                                viewModel.beginOffsetPlane()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("FaceSelectedOffsetPlaneButton")
+                        }
                         Button("Done") {
                             viewModel.commitTool()
                         }

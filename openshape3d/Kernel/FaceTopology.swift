@@ -360,7 +360,11 @@ nonisolated enum FaceTopology {
         }
     }
 
-    private static let smoothDihedralCos: Float = 0.72 // ~44°: joins tessellated
+    /// Curved-surface dihedral threshold: ~20° (`cos(20°) ≈ 0.94`). Joins
+    /// tessellated cylinder/fillet facets (7.5°–15° per step) while stopping at
+    /// sharp chamfers and creases (20°–45°+) so two adjacent chamfer faces are
+    /// never merged into one curved selection.
+    private static let smoothDihedralCos: Float = 0.94
                                                        // wall facets, stops at rims
 
     /// The connected SMOOTH surface containing `seedTriangle`: triangles joined
@@ -375,6 +379,66 @@ nonisolated enum FaceTopology {
         in mesh: RenderMesh, seedTriangle: Int
     ) -> (triangles: [Int], isCurved: Bool)? {
         smoothRegion(in: mesh, seedTriangle: seedTriangle, adjacency: nil)
+    }
+
+    /// Vertex-index edge key: in OCCT tessellations (`TessellateShape`), each
+    /// `TopoDS_Face` has its own disjoint vertex-index range. Triangles within
+    /// the SAME B-Rep face share exact vertex indices, whereas triangles across
+    /// different B-Rep faces (such as a 90° fillet face meeting its adjacent
+    /// planar wall tangentially at 0°) NEVER share vertex indices.
+    private struct IndexEdgeKey: Hashable {
+        let a, b: UInt32
+        init(_ i: UInt32, _ j: UInt32) {
+            if i <= j { a = i; b = j } else { a = j; b = i }
+        }
+    }
+
+    /// Flood-fill a connected component of triangles that share exact vertex
+    /// index pairs in `mesh.indices` (and optionally the same `faceRegions` tag).
+    /// On OCCT-tessellated meshes this isolates the exact `TopoDS_Face` without
+    /// leaking across G¹ tangent boundaries into adjacent planar walls or
+    /// neighbouring fillets.
+    private static func indexConnectedSurface(
+        in mesh: RenderMesh, seedTriangle: Int,
+        seedN: SIMD3<Float>, normalFn: (Int) -> SIMD3<Float>?
+    ) -> (triangles: Set<Int>, maxDot: Float)? {
+        let count = mesh.triangleCount
+        guard seedTriangle >= 0, seedTriangle < count else { return nil }
+        let regions = mesh.validFaceRegions
+        let seedRegion = regions?[seedTriangle]
+
+        var indexAdj = [IndexEdgeKey: [Int]]()
+        indexAdj.reserveCapacity(count * 3)
+        for t in 0..<count {
+            if let regions, regions[t] != seedRegion { continue }
+            let i0 = mesh.indices[t * 3]
+            let i1 = mesh.indices[t * 3 + 1]
+            let i2 = mesh.indices[t * 3 + 2]
+            indexAdj[IndexEdgeKey(i0, i1), default: []].append(t)
+            indexAdj[IndexEdgeKey(i1, i2), default: []].append(t)
+            indexAdj[IndexEdgeKey(i2, i0), default: []].append(t)
+        }
+
+        var surface = Set<Int>()
+        var queue = [seedTriangle]
+        var maxDot: Float = 1
+        while let t = queue.popLast() {
+            guard !surface.contains(t), let nt = normalFn(t) else { continue }
+            surface.insert(t)
+            maxDot = min(maxDot, simd_dot(nt, seedN))
+            let i0 = mesh.indices[t * 3]
+            let i1 = mesh.indices[t * 3 + 1]
+            let i2 = mesh.indices[t * 3 + 2]
+            for edge in [IndexEdgeKey(i0, i1), IndexEdgeKey(i1, i2), IndexEdgeKey(i2, i0)] {
+                for nb in indexAdj[edge] ?? [] where !surface.contains(nb) {
+                    if let nn = normalFn(nb), simd_dot(nn, nt) > smoothDihedralCos {
+                        queue.append(nb)
+                    }
+                }
+            }
+        }
+        guard !surface.isEmpty else { return nil }
+        return (surface, maxDot)
     }
 
     private static func smoothRegion(
@@ -395,7 +459,22 @@ nonisolated enum FaceTopology {
         }
         guard let seedN = normal(seedTriangle) else { return nil }
 
+        // First try OCCT B-Rep face isolation (via faceRegions or shared vertex
+        // indices). If `faceRegions` is present, or the vertex-index component
+        // is genuinely curved, return it directly so tangent fillets never
+        // bleed into adjacent planar walls or neighbouring corner patches.
+        // Also, if an index-connected component has ≥2 coplanar triangles
+        // (`maxDot >= normalTolerance`), it is a planar B-Rep face and must not
+        // fall through into a welded cross-crease flood fill.
+        if let idxComp = indexConnectedSurface(
+            in: mesh, seedTriangle: seedTriangle, seedN: seedN, normalFn: normal
+        ), (mesh.validFaceRegions != nil || idxComp.triangles.count >= 2) {
+            return (idxComp.triangles.sorted(), idxComp.maxDot < normalTolerance)
+        }
+
         let edgeTriangles = adjacency ?? Self.edgeAdjacency(in: mesh)
+        let regions = mesh.validFaceRegions
+        let seedRegion = regions?[seedTriangle]
 
         var surface = Set<Int>()
         var queue = [seedTriangle]
@@ -407,6 +486,7 @@ nonisolated enum FaceTopology {
             let (a, b, c) = tri(t)
             for edge in [EdgeKey(a, b), EdgeKey(b, c), EdgeKey(c, a)] {
                 for nb in edgeTriangles[edge] ?? [] where !surface.contains(nb) {
+                    if let regions, regions[nb] != seedRegion { continue }
                     if let nn = normal(nb), simd_dot(nn, nt) > smoothDihedralCos {
                         queue.append(nb)
                     }
@@ -440,44 +520,65 @@ nonisolated enum FaceTopology {
         }
         guard let seedN = normal(seedTriangle) else { return nil }
 
-        let edgeTriangles = adjacency ?? Self.edgeAdjacency(in: mesh)
-
-        // Flood-fill the smooth surface: neighbours join across soft edges.
-        var surface = Set<Int>()
-        var queue = [seedTriangle]
-        var maxDot: Float = 1 // how flat is it? (1 = all coplanar = a real plane)
-        while let t = queue.popLast() {
-            guard !surface.contains(t), let nt = normal(t) else { continue }
-            surface.insert(t)
-            maxDot = min(maxDot, simd_dot(nt, seedN))
-            let (a, b, c) = tri(t)
-            for edge in [EdgeKey(a, b), EdgeKey(b, c), EdgeKey(c, a)] {
-                for nb in edgeTriangles[edge] ?? [] where !surface.contains(nb) {
-                    if let nn = normal(nb), let nt2 = normal(t),
-                       simd_dot(nn, nt2) > smoothDihedralCos {
-                        queue.append(nb)
+        // Isolate the candidate surface: on OCCT B-Rep meshes, triangles within
+        // one cylindrical face (such as a 90° fillet) share vertex indices,
+        // whereas tangent planar walls have disjoint vertex indices. Using the
+        // index-connected component prevents leaking across 0° tangent borders.
+        let surface: Set<Int>
+        let maxDot: Float
+        if let idxComp = indexConnectedSurface(
+            in: mesh, seedTriangle: seedTriangle, seedN: seedN, normalFn: normal
+        ), (mesh.validFaceRegions != nil || (idxComp.triangles.count >= 4 && idxComp.maxDot < normalTolerance)) {
+            surface = idxComp.triangles
+            maxDot = idxComp.maxDot
+        } else {
+            let edgeTriangles = adjacency ?? Self.edgeAdjacency(in: mesh)
+            let regions = mesh.validFaceRegions
+            let seedRegion = regions?[seedTriangle]
+            var flooded = Set<Int>()
+            var queue = [seedTriangle]
+            var minDot: Float = 1
+            while let t = queue.popLast() {
+                guard !flooded.contains(t), let nt = normal(t) else { continue }
+                flooded.insert(t)
+                minDot = min(minDot, simd_dot(nt, seedN))
+                let (a, b, c) = tri(t)
+                for edge in [EdgeKey(a, b), EdgeKey(b, c), EdgeKey(c, a)] {
+                    for nb in edgeTriangles[edge] ?? [] where !flooded.contains(nb) {
+                        if let regions, regions[nb] != seedRegion { continue }
+                        if let nn = normal(nb), let nt2 = normal(t),
+                           simd_dot(nn, nt2) > smoothDihedralCos {
+                            queue.append(nb)
+                        }
                     }
                 }
             }
+            surface = flooded
+            maxDot = minDot
         }
         // A genuinely planar patch (all facets coplanar) isn't a cylinder.
-        guard surface.count >= 6, maxDot < normalTolerance else { return nil }
+        guard surface.count >= 4, maxDot < normalTolerance else { return nil }
 
-        // Collect surface vertices and normals.
+        // Collect surface vertices, triangle centroids, and normals.
         var verts: [SIMD3<Double>] = []
         var norms: [SIMD3<Double>] = []
+        var triCenters: [SIMD3<Double>] = []
         var seen = Set<PositionKey>()
         for t in surface {
             guard let nt = normal(t) else { continue }
             let nd = SIMD3<Double>(Double(nt.x), Double(nt.y), Double(nt.z))
             let (a, b, c) = tri(t)
-            for p in [a, b, c] {
+            let ad = SIMD3<Double>(Double(a.x), Double(a.y), Double(a.z))
+            let bd = SIMD3<Double>(Double(b.x), Double(b.y), Double(b.z))
+            let cd = SIMD3<Double>(Double(c.x), Double(c.y), Double(c.z))
+            for (p, pd) in [(a, ad), (b, bd), (c, cd)] {
                 let key = PositionKey(p)
                 if seen.insert(key).inserted {
-                    verts.append(SIMD3(Double(p.x), Double(p.y), Double(p.z)))
+                    verts.append(pd)
                 }
             }
             norms.append(nd)
+            triCenters.append((ad + bd + cd) / 3.0)
         }
         guard verts.count >= 6 else { return nil }
 
@@ -491,12 +592,79 @@ nonisolated enum FaceTopology {
         let axialLeak = norms.map { abs(simd_dot($0, axisDir)) }.reduce(0, +) / Double(norms.count)
         guard axialLeak < 0.12 else { return nil }
 
-        // Axis point (centroid) and radius (mean distance to the axis line).
-        var centroid = SIMD3<Double>.zero
-        for v in verts { centroid += v }
-        centroid /= Double(verts.count)
+        let ts = verts.map { simd_dot($0, axisDir) }
+        let minT = ts.min() ?? 0
+        let maxT = ts.max() ?? 0
+        guard maxT - minT > 1e-4 else { return nil }
+        let midT = (minT + maxT) * 0.5
+
+        // Compute the cylinder axis point:
+        // For a full 360° cylinder the vertex average lies on the axis, but for
+        // a partial cylinder (such as a 90° quarter-cylinder fillet) the vertex
+        // average sits near the arc! However, for ANY cylinder (full or partial),
+        // every surface normal line P_i + s * N_i passes directly through the
+        // cylinder axis in the 2D plane perpendicular to `axisDir`.
+        let refVec = abs(axisDir.y) < 0.9 ? SIMD3<Double>(0, 1, 0) : SIMD3<Double>(1, 0, 0)
+        let uAxis = simd_normalize(simd_cross(refVec, axisDir))
+        let vAxis = simd_cross(axisDir, uAxis)
+
+        // Solve least-squares intersection of 2D lines perpendicular to each
+        // triangle's projected normal: Σ (t_i · (C - P_i)) t_i = 0, where
+        // t_i = (-n_v, n_u) is the 2D tangent vector perpendicular to n_i.
+        var a00 = 0.0, a01 = 0.0, a11 = 0.0
+        var b0 = 0.0, b1 = 0.0
+        for i in norms.indices {
+            let n = norms[i]
+            let nu = simd_dot(n, uAxis)
+            let nv = simd_dot(n, vAxis)
+            let nLen = sqrt(nu * nu + nv * nv)
+            guard nLen > 1e-6 else { continue }
+            let tx = -nv / nLen
+            let ty = nu / nLen
+            let p = triCenters[i]
+            let px = simd_dot(p, uAxis)
+            let py = simd_dot(p, vAxis)
+            let dotTP = tx * px + ty * py
+            a00 += tx * tx
+            a01 += tx * ty
+            a11 += ty * ty
+            b0 += tx * dotTP
+            b1 += ty * dotTP
+        }
+
+        var axisPoint = SIMD3<Double>.zero
+        for v in verts { axisPoint += v }
+        axisPoint /= Double(verts.count)
+
+        let det = a00 * a11 - a01 * a01
+        if det > 1e-6 {
+            let cx = (a11 * b0 - a01 * b1) / det
+            let cy = (a00 * b1 - a01 * b0) / det
+            let fittedAxisPoint = uAxis * cx + vAxis * cy + axisDir * midT
+            func distTo(_ pt: SIMD3<Double>, _ v: SIMD3<Double>) -> Double {
+                let d = v - pt
+                let along = simd_dot(d, axisDir)
+                return simd_length(d - axisDir * along)
+            }
+            let fittedRadii = verts.map { distTo(fittedAxisPoint, $0) }
+            let fittedR = fittedRadii.reduce(0, +) / Double(fittedRadii.count)
+            let fittedSpread = sqrt(
+                fittedRadii.map { ($0 - fittedR) * ($0 - fittedR) }.reduce(0, +)
+                / Double(fittedRadii.count)
+            )
+            let avgRadii = verts.map { distTo(axisPoint, $0) }
+            let avgR = avgRadii.reduce(0, +) / Double(avgRadii.count)
+            let avgSpread = sqrt(
+                avgRadii.map { ($0 - avgR) * ($0 - avgR) }.reduce(0, +)
+                / Double(avgRadii.count)
+            )
+            if fittedR > 1e-4 && (fittedSpread < avgSpread || avgSpread >= avgR * 0.06) {
+                axisPoint = fittedAxisPoint
+            }
+        }
+
         func distToAxis(_ v: SIMD3<Double>) -> Double {
-            let d = v - centroid
+            let d = v - axisPoint
             let along = simd_dot(d, axisDir)
             return simd_length(d - axisDir * along)
         }
@@ -507,20 +675,15 @@ nonisolated enum FaceTopology {
         let spread = sqrt(radii.map { ($0 - radius) * ($0 - radius) }.reduce(0, +) / Double(radii.count))
         guard spread < radius * 0.06 else { return nil }
 
-        let ts = verts.map { simd_dot($0, axisDir) }
-        let minT = ts.min() ?? 0
-        let maxT = ts.max() ?? 0
-        guard maxT - minT > 1e-4 else { return nil }
-
         // Whole-body check: does a rebuilt cylinder of these params match?
         let matches = rebuiltCylinderMatches(
-            mesh: mesh, axisPoint: centroid, axisDir: axisDir,
+            mesh: mesh, axisPoint: axisPoint, axisDir: axisDir,
             radius: radius, minT: minT, maxT: maxT
         )
 
         return CylindricalFace(
             triangles: Array(surface).sorted(),
-            axisPoint: centroid, axisDir: axisDir, radius: radius,
+            axisPoint: axisPoint, axisDir: axisDir, radius: radius,
             minT: minT, maxT: maxT,
             segments: max(surface.count / 2, 12),
             matchesWholeBody: matches
@@ -638,10 +801,47 @@ nonisolated enum FaceTopology {
             let len = simd_length(x)
             return len > 1e-12 ? x / len : nil
         }
+        let regions = mesh.validFaceRegions
+        var indexAdj = [IndexEdgeKey: [Int]]()
+        indexAdj.reserveCapacity(count * 3)
+        for t in 0..<count {
+            let i0 = mesh.indices[t * 3]
+            let i1 = mesh.indices[t * 3 + 1]
+            let i2 = mesh.indices[t * 3 + 2]
+            indexAdj[IndexEdgeKey(i0, i1), default: []].append(t)
+            indexAdj[IndexEdgeKey(i1, i2), default: []].append(t)
+            indexAdj[IndexEdgeKey(i2, i0), default: []].append(t)
+        }
         var next = 0
         for seed in 0..<count where component[seed] == -2 {
-            guard normal(seed) != nil else { component[seed] = -1; continue }
+            guard let seedN = normal(seed) else { component[seed] = -1; continue }
             let id = next; next += 1
+            // Check if the index-connected component from seed is a curved multi-triangle face.
+            var idxGroup = Set<Int>()
+            var idxQueue = [seed]
+            var idxMaxDot: Float = 1
+            let seedRegion = regions?[seed]
+            while let t = idxQueue.popLast() {
+                guard !idxGroup.contains(t), let nt = normal(t) else { continue }
+                idxGroup.insert(t)
+                idxMaxDot = min(idxMaxDot, simd_dot(nt, seedN))
+                let i0 = mesh.indices[t * 3]
+                let i1 = mesh.indices[t * 3 + 1]
+                let i2 = mesh.indices[t * 3 + 2]
+                for edge in [IndexEdgeKey(i0, i1), IndexEdgeKey(i1, i2), IndexEdgeKey(i2, i0)] {
+                    for nb in indexAdj[edge] ?? [] where !idxGroup.contains(nb) && component[nb] == -2 {
+                        if let regions, regions[nb] != seedRegion { continue }
+                        if let nn = normal(nb), simd_dot(nn, nt) > smoothDihedralCos {
+                            idxQueue.append(nb)
+                        }
+                    }
+                }
+            }
+            if regions != nil || (idxGroup.count >= 4 && idxMaxDot < normalTolerance) {
+                for t in idxGroup { component[t] = id }
+                continue
+            }
+
             var queue = [seed]
             component[seed] = id
             while let t = queue.popLast() {
@@ -683,7 +883,7 @@ nonisolated enum FaceTopology {
             if !cylinderRefused.contains(region) {
                 if let cyl = cylindricalFace(in: mesh, seedTriangle: seed, adjacency: adjacency) {
                     let fresh = cyl.triangles.filter { $0 >= 0 && $0 < count && !claimed[$0] }
-                    if fresh.contains(seed), fresh.count >= 6 {
+                    if fresh.contains(seed), fresh.count >= 4 {
                         for t in fresh { claimed[t] = true }
                         var face = cyl
                         face.triangles = fresh.sorted()
